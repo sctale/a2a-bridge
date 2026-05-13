@@ -207,6 +207,25 @@ async def health():
     """健康检查"""
     return {"status": "ok", "agent": "agent-a", "port": 8643}
 
+@app.get("/ready")
+async def ready():
+    """
+    就绪探针：AI Agent 预热完成后返回 ok。
+    用于 Kubernetes readinessProbe，避免预热期间接收流量。
+    """
+    agent_ready = get_agent() is not None
+    return {"status": "ok" if agent_ready else "loading", "agent_ready": agent_ready}
+
+
+@app.get("/live")
+async def live():
+    """
+    存活探针：始终返回 ok。
+    用于 Kubernetes livenessProbe，只要进程在就返回 ok。
+    """
+    return {"status": "ok"}
+
+
 
 @app.post("/tasks")
 async def create_task(request: Dict[str, Any]):
