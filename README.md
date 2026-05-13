@@ -2,7 +2,9 @@
 
 > 让两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库，最小实现，够用就行。
 
-**核心特性：** 事件循环不堵 · 幂等 · 状态机 · 异步预热 · 零外部依赖
+**核心特性：** 事件循环不堵 · 幂等 · 状态机 · 异步预热 · httpx 直调 AI
+
+**当前版本：** v2.0.0 — httpx AsyncClient 直调 AI（不再走 subprocess，冷启动问题已解决）
 
 ---
 
@@ -332,7 +334,7 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 - [x] 健康检查探针（readiness / liveness）— PR #2
 - [x] API 版本协商（capabilities endpoint）— PR #4
 - [x] GitHub Actions CI 自动化测试 — PR #6
-- [ ] 进程池方案（方案C）— 解决 subprocess 冷启动慢问题
+- [x] httpx AsyncClient 直调 AI（替代 subprocess，解决冷启动）— v2.0.0
 - [ ] 支持 WebSocket 双向推送
 - [ ] 消息持久化（SQLite 表，支持重启恢复）
 - [ ] mTLS 双向认证
@@ -340,23 +342,11 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 
 ---
 
-## 冷启动问题与方案C（进程池）
+## httpx 直调 AI 方案（v2.0.0）
 
 ### 问题
 
-当 Agent B 使用 subprocess 调用本地 AI CLI（如 `qwenpaw agents chat`）时：
-
-```
-A2A Request → FastAPI → asyncio.to_thread → subprocess.run(qwenpaw CLI)
-                                              ↑
-                                        每次fork，冷启动 10-120s
-```
-
-每次收到 A2A 请求都 fork 新进程，AI 模型加载需要 10-120s，导致 A2A 超时。
-
-### 方案C：进程池
-
-**核心思路：** 启动时预创建 2-3 个空闲子进程，用队列调度，AI 请求复用已有进程，消除每次 fork 的冷启动。
+当 Agent 使用 subprocess 调用本地 AI CLI（如 `qwenpaw agents chat`）时，每次收到 A2A 请求都 fork 新进程，AI 模型加载需要 10-120s，导致 A2A 超时。
 
 ```python
 import multiprocessing as mp

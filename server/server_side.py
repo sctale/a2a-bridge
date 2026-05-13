@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
 """
-Agent A — A2A Server（端口 8643）
-
-功能：
-  POST /tasks       — 接收任务，AI 对话处理，返回 task_result
-  GET  /health     — 健康检查
-  GET  /tasks/{id} — 任务状态查询
-  GET  /ready      — 就绪探针（AI预热完成后ok）
-  GET  /live       — 存活探针（始终ok）
-  GET  /capabilities — 支持的API版本和特性列表
-
-核心特性：
-  · 事件循环不堵 — 同步代码走 asyncio.to_thread()
-  · AI 异步预热 — 启动时后台加载，不阻塞 ping
-  · 幂等存储    — SQLite task_id 查重
-  · 状态机      — pending → processing → completed/failed
-  · API版本协商  — 支持多版本，自动协商兼容版本
-
-依赖：fastapi uvicorn httpx
+Agent A2A Server Template
+Receives task delegations and processes with AI
 """
-
 import asyncio
 import json
 import logging
@@ -31,26 +14,27 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+# 设置 PYTHONPATH 确保能导入 hermes 模块
+sys.path.insert(0, os.environ.get("HERMES_PATH", "/opt/hermes"))
+sys.path.insert(0, os.path.join(os.environ.get("HERMES_PATH", "/opt/hermes"), ".venv/lib/python3.11/site-packages"))
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 
 # ===== 日志 =====
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("a2a-server-a")
+logger = logging.getLogger("a2a_server")
 
 # ===== FastAPI App =====
-app = FastAPI(title="Agent A — A2A Server", version="1.0.0")
+app = FastAPI(title="Agent A2A Server", version="2.1.0")
 
 # ===== 内存任务存储 =====
 tasks: Dict[str, Dict[str, Any]] = {}
 
-# ════════════════════════════════════════════════════════════
-# 幂等存储（SQLite）
-# ════════════════════════════════════════════════════════════
-
+# ===== 幂等存储（SQLite）=====
 class IdempotencyStore:
-    """task_id 查重，命中直接返回缓存结果"""
+    """轻量幂等存储：task_id 查重 + 结果缓存"""
 
     def __init__(self, db_path: str = "/tmp/a2a_idempotency.db"):
         self._lock = threading.Lock()
@@ -58,179 +42,125 @@ class IdempotencyStore:
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS processed_tasks (
                 task_id TEXT PRIMARY KEY,
-                status  TEXT NOT NULL,
-                result  TEXT,
+                status TEXT NOT NULL,
+                result TEXT,
                 completed_at TEXT NOT NULL
             )
         """)
-        self._db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_completed_at ON processed_tasks(completed_at)"
-        )
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_completed_at ON processed_tasks(completed_at)")
 
     def get(self, task_id: str) -> Optional[Dict]:
+        """查询 task_id 是否已有结果"""
         with self._lock:
-            row = self._db.execute(
+            cursor = self._db.execute(
                 "SELECT status, result, completed_at FROM processed_tasks WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
+                (task_id,)
+            )
+            row = cursor.fetchone()
             if row:
-                return {
-                    "status": row[0],
-                    "result": json.loads(row[1]) if row[1] else None,
-                    "completed_at": row[2],
-                }
+                return {"status": row[0], "result": json.loads(row[1]) if row[1] else None, "completed_at": row[2]}
             return None
 
     def set(self, task_id: str, status: str, result: Optional[Dict] = None):
+        """写入处理结果"""
         with self._lock:
             self._db.execute(
-                "INSERT OR REPLACE INTO processed_tasks VALUES (?, ?, ?, ?)",
-                (task_id, status, json.dumps(result, ensure_ascii=False),
-                 datetime.now().isoformat()),
+                "INSERT OR REPLACE INTO processed_tasks (task_id, status, result, completed_at) VALUES (?, ?, ?, ?)",
+                (task_id, status, json.dumps(result, ensure_ascii=False), datetime.now().isoformat())
             )
             self._db.commit()
 
-
 _idempotency = IdempotencyStore()
 
-# ════════════════════════════════════════════════════════════
-# AI Agent 懒加载 + 异步预热
-# ════════════════════════════════════════════════════════════
 
+# ===== AI Agent 初始化（启动预热，不阻塞请求）=====
 _agent = None
-
 
 @app.on_event("startup")
 async def startup():
-    """启动时异步预热 AI Agent，不阻塞请求处理"""
+    """启动时异步预热 AI Agent，不阻塞请求"""
     asyncio.create_task(preload_agent())
-
 
 async def preload_agent():
     """后台预加载 AI Agent"""
     global _agent
     try:
-        logger.info("[A2A] AI Agent 预热中...")
-        _agent = await asyncio.to_thread(_load_agent_sync)
+        logger.info("[A2A] 预热 AI Agent 中...")
+        _agent = await asyncio.to_thread(load_agent_sync)
         logger.info("[A2A] AI Agent 预热完成")
     except Exception as exc:
         logger.exception(f"[A2A] AI Agent 预热失败: {exc}")
 
+def load_agent_sync():
+    """同步加载 AIAgent（运行在线程池中）"""
+    from run_agent import AIAgent
+    from hermes_cli.config import load_config
 
-def _load_agent_sync():
-    """
-    同步加载 AI Agent。
-    ─────────────────────────────────────────────────────────────
-    在这里替换为你实际使用的 AI 初始化逻辑。
-    示例（OpenAI）：
-        from openai import OpenAI
-        return OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    示例（Anthropic）：
-        import anthropic
-        return anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    ─────────────────────────────────────────────────────────────
-    """
-    # ── TODO: 替换为你的 AI 初始化代码 ──
-    # 示例（占位）：
-    # from some_ai_sdk import AIAgent
-    # return AIAgent(api_key=os.environ.get("YOUR_API_KEY"))
-    return None
+    config = load_config()
+    model_cfg = config.get("model", {})
 
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    base_url = os.environ.get("OPENAI_BASE_URL", "") or model_cfg.get("base_url", "")
+    model = model_cfg.get("model", "gpt-4o")
+    provider = model_cfg.get("provider", "openai")
+
+    return AIAgent(
+        base_url=base_url,
+        api_key=api_key,
+        provider=provider,
+        model=model,
+        platform="a2a",
+        skip_memory=False,
+        skip_context_files=True,
+    )
 
 def get_agent():
-    """返回已预热的 Agent（可能为 None）"""
+    """懒加载，返回已预热或已加载的 Agent"""
     return _agent
 
 
-# ════════════════════════════════════════════════════════════
-# AI 调用（异步 httpx，事件循环不堵）
-# ════════════════════════════════════════════════════════════
-
+# ===== AI 调用（异步 httpx，事件循环不堵）=====
 async def call_ai(system_prompt: str, instruction: str) -> str:
-    """
-    httpx 异步调用 LLM API。
-    ─────────────────────────────────────────────────────────────
-    在这里替换为你实际使用的 LLM 提供商。
+    """httpx 异步调用 MiniMax API，事件循环始终保持响应"""
+    import httpx
 
-    示例（OpenAI Compatible）：
-        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        api_key  = os.environ.get("OPENAI_API_KEY", "")
+    api_key = ""
+    base_url = os.environ.get("AI_PROVIDER_BASE_URL", "https://api.minimaxi.com/anthropic")
+    env_path = os.environ.get("A2A_ENV_PATH", ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                if "AI_PROVIDER_API_KEY" in line and not line.strip().startswith("#"):
+                    api_key = line.split("=", 1)[1].strip()
+                    break
+                if "AI_PROVIDER_BASE_URL" in line and not line.strip().startswith("#"):
+                    base_url = line.split("=", 1)[1].strip()
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": "gpt-4o",
-                    "max_tokens": 1024,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": instruction},
-                    ],
-                },
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-    ─────────────────────────────────────────────────────────────
-    """
-    # ── TODO: 替换为你的 LLM API 调用 ──
-    await asyncio.sleep(0.1)  # 避免未实现时阻塞
-    return f"[AI 未实现] 收到: {instruction[:50]}"
-
-
-# ════════════════════════════════════════════════════════════
-# API 版本协商
-# ════════════════════════════════════════════════════════════
-
-SUPPORTED_VERSIONS = ["1.0", "1.1"]
-DEFAULT_VERSION = "1.0"
-
-
-def negotiate_version(requested: Optional[str]) -> str:
-    """
-    版本协商逻辑：
-
-    - 客户端指定版本 → 若支持则使用，否则返回错误
-    - 不指定版本 → 默认 1.0
-    - 协商结果写入响应 header 和 body
-
-    返回值：实际使用的版本字符串
-    """
-    if not requested:
-        return DEFAULT_VERSION
-    if requested in SUPPORTED_VERSIONS:
-        return requested
-    # 不支持的版本取最接近的旧版本（向后兼容）
-    return DEFAULT_VERSION
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{base_url}/v1/messages",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": os.environ.get("A2A_MODEL", "gpt-4o"),
+                "max_tokens": int(os.environ.get("A2A_MAX_TOKENS", "1024")),
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": instruction}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get("content", []):
+            if item.get("type") == "text":
+                return item.get("text", "")
+        return str(data.get("content", []))
 
 
-def capabilities() -> Dict[str, Any]:
-    """返回服务端支持的 API 版本和特性矩阵"""
-    return {
-        "server_version": "1.0",
-        "supported_versions": SUPPORTED_VERSIONS,
-        "features": {
-            "idempotency": True,
-            "state_machine": True,
-            "async_preload": True,
-            "capabilities_endpoint": True,
-            "version_negotiation": True,
-        },
-        "endpoints": {
-            "POST /tasks": "接收任务委托",
-            "GET  /tasks/{id}": "查询任务状态",
-            "GET  /health": "健康检查",
-            "GET  /ready": "就绪探针",
-            "GET  /live": "存活探针",
-            "GET  /capabilities": "支持的版本和特性",
-        },
-    }
-
-
-# ════════════════════════════════════════════════════════════
-# 工具函数
-# ════════════════════════════════════════════════════════════
-
+# ===== 工具函数 =====
 def make_response(
     task_id: str,
     status: str,
@@ -238,11 +168,9 @@ def make_response(
     error: Optional[Dict] = None,
     from_agent: str = "agent-a",
     to_agent: str = "agent-b",
-    api_version: Optional[str] = None,
 ) -> Dict:
-    version = negotiate_version(api_version) if api_version else DEFAULT_VERSION
-    resp = {
-        "version": version,
+    return {
+        "version": "1.0",
         "type": "task_result",
         "from": from_agent,
         "to": to_agent,
@@ -251,116 +179,33 @@ def make_response(
         "result": result,
         "error": error,
     }
-    return resp
 
 
-# ════════════════════════════════════════════════════════════
-# 路由
-# ════════════════════════════════════════════════════════════
+# ===== 路由 =====
 
 @app.get("/health")
 async def health():
     """健康检查"""
     return {"status": "ok", "agent": "agent-a", "port": 8643}
 
-@app.get("/ready")
-async def ready():
-    """
-    就绪探针：AI Agent 预热完成后返回 ok。
-    用于 Kubernetes readinessProbe，避免预热期间接收流量。
-    """
-    agent_ready = get_agent() is not None
-    return {"status": "ok" if agent_ready else "loading", "agent_ready": agent_ready}
-
-
-@app.get("/live")
-async def live():
-    """
-    存活探针：始终返回 ok。
-    用于 Kubernetes livenessProbe，只要进程在就返回 ok。
-    """
-    return {"status": "ok"}
-
-
-
-@app.get("/ready")
-async def ready():
-    """
-    就绪探针：AI Agent 预热完成后返回 ok。
-    用于 Kubernetes readinessProbe，避免预热期间接收流量。
-    """
-    agent_ready = get_agent() is not None
-    return {
-        "status": "ready" if agent_ready else "degraded",
-        "ready": agent_ready,
-    }
-
-
-@app.get("/live")
-async def live():
-    """
-    存活探针：始终返回 ok。
-    用于 Kubernetes livenessProbe，只要进程在就返回 ok。
-    """
-    return {"status": "ok"}
-
-
-@app.get("/capabilities")
-async def get_capabilities():
-    """
-    返回支持的 API 版本和特性列表。
-    用于客户端在发起请求前探明服务端能力。
-    """
-    return capabilities()
-
 
 @app.post("/tasks")
 async def create_task(request: Dict[str, Any]):
     """
-    接收任务委托，AI 对话处理后返回 task_result。
-
-    Body:
-        {
-          "version": "1.0",
-          "type": "task_delegate",
-          "from": "agent-b",
-          "to": "agent-a",
-          "task_id": "uuid-v4",
-          "timestamp": "...",
-          "payload": {
-            "task_type": "chat | ping | ...",
-            "instruction": "...",
-            "context": {}
-          }
-        }
+    接收任务委托，用 AI 对话处理
+    Body: {version, type, from, to, task_id, timestamp, payload}
     """
     try:
-        # ── 版本协商 ──────────────────────────────────────────
-        raw_version = request.get("version")
-        negotiated_version = negotiate_version(raw_version)
-        if raw_version and raw_version != negotiated_version:
-            logger.warning(
-                f"[A2A] 版本不支持: {raw_version} → 协商为 {negotiated_version}"
-            )
+        version = request.get("version", "1.0")
+        msg_type = request.get("type")
+        from_agent = request.get("from")
+        to_agent = request.get("to")
+        task_id = request.get("task_id") or str(uuid.uuid4())
+        timestamp = request.get("timestamp", datetime.now().isoformat())
+        payload = request.get("payload", {})
 
-        version    = negotiated_version
-        msg_type   = request.get("type")
-        from_agent = request.get("from", "unknown")
-        to_agent   = request.get("to", "unknown")
-        task_id    = request.get("task_id") or str(uuid.uuid4())
-        timestamp  = request.get("timestamp", datetime.now().isoformat())
-        payload    = request.get("payload", {})
-        context    = payload.get("context", {})
+        logger.info(f"[A2A] 收到任务: {task_id} from {from_agent} → {to_agent} ({msg_type})")
 
-        # task_type 可能藏在 context 里（跨 agent 消息格式）
-        task_type = context.get("task_type") or payload.get("task_type", "chat")
-        instruction = payload.get("instruction", "")
-
-        logger.info(
-            f"[A2A] 收到任务: {task_id} | {from_agent} → {to_agent} | type={task_type}"
-        )
-
-        # ── 消息类型过滤 ─────────────────────────────────────
         if msg_type != "task_delegate":
             return JSONResponse(
                 status_code=400,
@@ -368,7 +213,6 @@ async def create_task(request: Dict[str, Any]):
                     task_id=task_id,
                     status="failed",
                     error={"code": 400, "message": f"不支持的消息类型: {msg_type}"},
-                    api_version=version,
                 ),
             )
 
@@ -379,24 +223,27 @@ async def create_task(request: Dict[str, Any]):
                     task_id=task_id,
                     status="failed",
                     error={"code": 400, "message": f"未知目标: {to_agent}"},
-                    api_version=version,
                 ),
             )
 
-        # ── 幂等检查 ────────────────────────────────────────
+        instruction = payload.get("instruction", "")
+        context = payload.get("context", {})
+        # task_type 可能藏在 context 里（跨 agent 消息格式）
+        task_type = context.get("task_type") or payload.get("task_type", "chat")
+
+        # ===== 幂等检查 =====
         cached = _idempotency.get(task_id)
         if cached:
-            logger.info(f"[A2A] 幂等命中: {task_id}")
+            logger.info(f"[A2A] 幂等命中: {task_id}，直接返回缓存结果")
             return JSONResponse(content=make_response(
                 task_id=task_id,
                 status=cached["status"],
                 result=cached["result"],
-                from_agent="agent-a",
+                from_agent=os.environ.get("AGENT_NAME", "agent-a"),
                 to_agent=from_agent,
-                api_version=version,
             ))
 
-        # ── 写入任务：pending ────────────────────────────────
+        # ===== 写入任务：pending =====
         tasks[task_id] = {
             "status": "pending",
             "created_at": datetime.now().isoformat(),
@@ -408,7 +255,7 @@ async def create_task(request: Dict[str, Any]):
             "completed_at": None,
         }
 
-        # ── ping：直接返回，不走 AI ─────────────────────────
+        # ===== ping 直接返回，不走 AI =====
         if task_type == "ping":
             tasks[task_id].update({
                 "status": "completed",
@@ -421,27 +268,27 @@ async def create_task(request: Dict[str, Any]):
                 task_id=task_id,
                 status="completed",
                 result=result,
-                from_agent="agent-a",
+                from_agent=os.environ.get("AGENT_NAME", "agent-a"),
                 to_agent=from_agent,
-                api_version=version,
             ))
 
-        # ── 构建 system prompt ──────────────────────────────
-        system_prompt = "You are Agent A, a helpful AI assistant. Be concise and direct."
+        # ===== 构建 system prompt =====
+        system_prompt = "你叫小马，是 Sid 的 AI 助手。回答简洁直接，一针见血。"
         if context:
             system_prompt += f"\n\n附加上下文: {json.dumps(context, ensure_ascii=False)}"
 
-        # ── 进 processing ─────────────────────────────────
+        # ===== 进 processing =====
         tasks[task_id].update({
             "status": "processing",
             "started_at": datetime.now().isoformat(),
         })
 
-        # ── AI 调用（异步，不堵事件循环）───────────────────
+        # ===== AI 调用（异步，不堵事件循环）=====
         try:
             response_text = await call_ai(system_prompt, instruction)
         except Exception as ai_exc:
-            logger.warning(f"[A2A] AI 调用异常: {type(ai_exc).__name__}: {ai_exc}")
+            import sys
+            print(f"[A2A DEBUG] AI exception: {type(ai_exc).__name__}: {ai_exc}", file=sys.stderr)
             response_text = f"收到: {instruction[:50]}... (AI处理异常)"
 
         logger.info(f"[A2A] AI 响应: {response_text[:80]}...")
@@ -452,7 +299,7 @@ async def create_task(request: Dict[str, Any]):
             "attachments": [],
         }
 
-        # ── 完成任务 ──────────────────────────────────────
+        # ===== 完成任务 =====
         tasks[task_id].update({
             "status": "completed",
             "response": response_text,
@@ -464,9 +311,8 @@ async def create_task(request: Dict[str, Any]):
             task_id=task_id,
             status="success",
             result=result,
-            from_agent="agent-a",
+            from_agent=os.environ.get("AGENT_NAME", "agent-a"),
             to_agent=from_agent,
-            api_version=version,
         ))
 
     except Exception as exc:
@@ -477,7 +323,6 @@ async def create_task(request: Dict[str, Any]):
                 task_id=request.get("task_id", "unknown"),
                 status="failed",
                 error={"code": 500, "message": str(exc)},
-                api_version=version,
             ),
         )
 
@@ -490,9 +335,11 @@ async def get_task(task_id: str):
     return tasks[task_id]
 
 
-# ════════════════════════════════════════════════════════════
-# 启动
-# ════════════════════════════════════════════════════════════
-
+# ===== 启动 =====
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8643, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("A2A_PORT", "8643")),
+        log_level="info",
+    )
