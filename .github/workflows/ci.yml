@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      agent-a:
+        image: python:3.11-slim
+        ports:
+          - 8643:8643
+        options: >-
+          --health-cmd "python -c 'import httpx; httpx.get("http://localhost:8643/health").raise_for_status()'"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 5
+        env:
+          PYTHONUNBUFFERED: "1"
+        command: >
+          bash -c "pip install fastapi uvicorn httpx &&
+          python -m uvicorn server_side:app --host 0.0.0.0 --port 8643 &>
+          /tmp/server.log &
+          sleep 5 &&
+          python -c 'import httpx; httpx.get("http://localhost:8643/health").raise_for_status()'"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install fastapi uvicorn httpx pytest requests
+
+      # ── Test 1: /health ──────────────────────────────────
+      - name: Test /health endpoint
+        run: |
+          curl -sf http://localhost:8643/health || exit 1
+          echo "✅ /health ok"
+
+      # ── Test 2: /ready and /live ─────────────────────────
+      - name: Test /ready and /live
+        run: |
+          RESP=$(curl -sf http://localhost:8643/ready)
+          echo "✅ /ready: $RESP"
+
+          LIVE=$(curl -sf http://localhost:8643/live)
+          echo "✅ /live: $LIVE"
+
+      # ── Test 3: ping ──────────────────────────────────────
+      - name: Test ping (idempotent)
+        run: |
+          FIRST=$(curl -sf -X POST http://localhost:8643/tasks \
+            -H "Content-Type: application/json" \
+            -d '{"version":"1.0","type":"task_delegate","from":"ci","to":"agent-a","task_id":"ci-ping-001","payload":{"task_type":"ping"}}')
+          echo "Ping #1: $FIRST"
+
+          SECOND=$(curl -sf -X POST http://localhost:8643/tasks \
+            -H "Content-Type: application/json" \
+            -d '{"version":"1.0","type":"task_delegate","from":"ci","to":"agent-a","task_id":"ci-ping-001","payload":{"task_type":"ping"}}')
+          echo "Ping #2 (same task_id, should be cached): $SECOND"
+
+      # ── Test 4: version negotiation ─────────────────────────
+      - name: Test version negotiation
+        run: |
+          # v1.1 should be supported
+          V11=$(curl -sf -X POST http://localhost:8643/tasks \
+            -H "Content-Type: application/json" \
+            -d '{"version":"1.1","type":"task_delegate","from":"ci","to":"agent-a","task_id":"ci-ver-001","payload":{"task_type":"ping"}}')
+          echo "Version 1.1 response: $V11"
+
+      # ── Test 5: /capabilities ─────────────────────────────
+      - name: Test /capabilities endpoint
+        run: |
+          CAPS=$(curl -sf http://localhost:8643/capabilities)
+          echo "Capabilities: $CAPS"
+          echo "$CAPS" | grep -q "supported_versions" || exit 1
+          echo "✅ /capabilities ok"
