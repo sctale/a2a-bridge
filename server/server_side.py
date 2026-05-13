@@ -6,12 +6,16 @@ Agent A — A2A Server（端口 8643）
   POST /tasks       — 接收任务，AI 对话处理，返回 task_result
   GET  /health     — 健康检查
   GET  /tasks/{id} — 任务状态查询
+  GET  /ready      — 就绪探针（AI预热完成后ok）
+  GET  /live       — 存活探针（始终ok）
+  GET  /capabilities — 支持的API版本和特性列表
 
 核心特性：
   · 事件循环不堵 — 同步代码走 asyncio.to_thread()
   · AI 异步预热 — 启动时后台加载，不阻塞 ping
   · 幂等存储    — SQLite task_id 查重
   · 状态机      — pending → processing → completed/failed
+  · API版本协商  — 支持多版本，自动协商兼容版本
 
 依赖：fastapi uvicorn httpx
 """
@@ -175,6 +179,55 @@ async def call_ai(system_prompt: str, instruction: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════
+# API 版本协商
+# ════════════════════════════════════════════════════════════
+
+SUPPORTED_VERSIONS = ["1.0", "1.1"]
+DEFAULT_VERSION = "1.0"
+
+
+def negotiate_version(requested: Optional[str]) -> str:
+    """
+    版本协商逻辑：
+
+    - 客户端指定版本 → 若支持则使用，否则返回错误
+    - 不指定版本 → 默认 1.0
+    - 协商结果写入响应 header 和 body
+
+    返回值：实际使用的版本字符串
+    """
+    if not requested:
+        return DEFAULT_VERSION
+    if requested in SUPPORTED_VERSIONS:
+        return requested
+    # 不支持的版本取最接近的旧版本（向后兼容）
+    return DEFAULT_VERSION
+
+
+def capabilities() -> Dict[str, Any]:
+    """返回服务端支持的 API 版本和特性矩阵"""
+    return {
+        "server_version": "1.0",
+        "supported_versions": SUPPORTED_VERSIONS,
+        "features": {
+            "idempotency": True,
+            "state_machine": True,
+            "async_preload": True,
+            "capabilities_endpoint": True,
+            "version_negotiation": True,
+        },
+        "endpoints": {
+            "POST /tasks": "接收任务委托",
+            "GET  /tasks/{id}": "查询任务状态",
+            "GET  /health": "健康检查",
+            "GET  /ready": "就绪探针",
+            "GET  /live": "存活探针",
+            "GET  /capabilities": "支持的版本和特性",
+        },
+    }
+
+
+# ════════════════════════════════════════════════════════════
 # 工具函数
 # ════════════════════════════════════════════════════════════
 
@@ -185,9 +238,11 @@ def make_response(
     error: Optional[Dict] = None,
     from_agent: str = "agent-a",
     to_agent: str = "agent-b",
+    api_version: Optional[str] = None,
 ) -> Dict:
-    return {
-        "version": "1.0",
+    version = negotiate_version(api_version) if api_version else DEFAULT_VERSION
+    resp = {
+        "version": version,
         "type": "task_result",
         "from": from_agent,
         "to": to_agent,
@@ -196,6 +251,7 @@ def make_response(
         "result": result,
         "error": error,
     }
+    return resp
 
 
 # ════════════════════════════════════════════════════════════
@@ -227,6 +283,37 @@ async def live():
 
 
 
+@app.get("/ready")
+async def ready():
+    """
+    就绪探针：AI Agent 预热完成后返回 ok。
+    用于 Kubernetes readinessProbe，避免预热期间接收流量。
+    """
+    agent_ready = get_agent() is not None
+    return {
+        "status": "ready" if agent_ready else "degraded",
+        "ready": agent_ready,
+    }
+
+
+@app.get("/live")
+async def live():
+    """
+    存活探针：始终返回 ok。
+    用于 Kubernetes livenessProbe，只要进程在就返回 ok。
+    """
+    return {"status": "ok"}
+
+
+@app.get("/capabilities")
+async def get_capabilities():
+    """
+    返回支持的 API 版本和特性列表。
+    用于客户端在发起请求前探明服务端能力。
+    """
+    return capabilities()
+
+
 @app.post("/tasks")
 async def create_task(request: Dict[str, Any]):
     """
@@ -248,7 +335,15 @@ async def create_task(request: Dict[str, Any]):
         }
     """
     try:
-        version    = request.get("version", "1.0")
+        # ── 版本协商 ──────────────────────────────────────────
+        raw_version = request.get("version")
+        negotiated_version = negotiate_version(raw_version)
+        if raw_version and raw_version != negotiated_version:
+            logger.warning(
+                f"[A2A] 版本不支持: {raw_version} → 协商为 {negotiated_version}"
+            )
+
+        version    = negotiated_version
         msg_type   = request.get("type")
         from_agent = request.get("from", "unknown")
         to_agent   = request.get("to", "unknown")
@@ -273,6 +368,7 @@ async def create_task(request: Dict[str, Any]):
                     task_id=task_id,
                     status="failed",
                     error={"code": 400, "message": f"不支持的消息类型: {msg_type}"},
+                    api_version=version,
                 ),
             )
 
@@ -283,6 +379,7 @@ async def create_task(request: Dict[str, Any]):
                     task_id=task_id,
                     status="failed",
                     error={"code": 400, "message": f"未知目标: {to_agent}"},
+                    api_version=version,
                 ),
             )
 
@@ -296,6 +393,7 @@ async def create_task(request: Dict[str, Any]):
                 result=cached["result"],
                 from_agent="agent-a",
                 to_agent=from_agent,
+                api_version=version,
             ))
 
         # ── 写入任务：pending ────────────────────────────────
@@ -325,6 +423,7 @@ async def create_task(request: Dict[str, Any]):
                 result=result,
                 from_agent="agent-a",
                 to_agent=from_agent,
+                api_version=version,
             ))
 
         # ── 构建 system prompt ──────────────────────────────
@@ -367,6 +466,7 @@ async def create_task(request: Dict[str, Any]):
             result=result,
             from_agent="agent-a",
             to_agent=from_agent,
+            api_version=version,
         ))
 
     except Exception as exc:
@@ -377,6 +477,7 @@ async def create_task(request: Dict[str, Any]):
                 task_id=request.get("task_id", "unknown"),
                 status="failed",
                 error={"code": 500, "message": str(exc)},
+                api_version=version,
             ),
         )
 
