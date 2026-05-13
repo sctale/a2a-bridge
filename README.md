@@ -1,5 +1,8 @@
 # A2A Bridge — 轻量级多 Agent 通信框架
 
+[![Version](https://img.shields.io/badge/version-v2.0.0-blue)](https://github.com/sctale/a2a-bridge/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 > 让两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库，最小实现，够用就行。
 
 **核心特性：** 事件循环不堵 · 幂等 · 状态机 · 异步预热 · httpx 直调 AI
@@ -326,6 +329,15 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 └── examples/
     └── docker-compose/   # Docker 部署示例
 ```
+
+---
+
+## 版本历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v1.0.0 | 2026-05-12 | 初始版本（subprocess 方式） |
+| **v2.0.0** | 2026-05-13 | httpx AsyncClient 直调 AI，替代 subprocess；完整幂等存储；Agent A + Agent B 双端 |
 
 ---
 
