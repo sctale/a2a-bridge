@@ -73,6 +73,55 @@ class IdempotencyStore:
 _idempotency = IdempotencyStore()
 
 
+# ===== 会话亲和存储（SQLite）=====
+class SessionStore:
+    """会话历史存储：session_id → 历史消息列表，支持多轮对话上下文"""
+
+    def __init__(self, db_path: str = "/tmp/a2a_sessions.db"):
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS a2a_sessions (
+                session_id TEXT PRIMARY KEY,
+                messages TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_updated_at ON a2a_sessions(updated_at)")
+
+    def get_history(self, session_id: str, limit: int = 10) -> list:
+        """获取最近 limit 条历史消息"""
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT messages FROM a2a_sessions WHERE session_id = ?",
+                (session_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return []
+            msgs = json.loads(row[0])
+            return msgs[-limit:] if len(msgs) > limit else msgs
+
+    def append(self, session_id: str, role: str, content: str, limit: int = 20):
+        """追加一条消息到会话历史"""
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT messages FROM a2a_sessions WHERE session_id = ?",
+                (session_id,)
+            )
+            row = cursor.fetchone()
+            msgs = json.loads(row[0]) if row else []
+            msgs.append({"role": role, "content": content})
+            msgs = msgs[-limit:]
+            self._db.execute(
+                "INSERT OR REPLACE INTO a2a_sessions (session_id, messages, updated_at) VALUES (?, ?, ?)",
+                (session_id, json.dumps(msgs, ensure_ascii=False), datetime.now().isoformat())
+            )
+            self._db.commit()
+
+_session_store = SessionStore()
+
+
 # ===== AI Agent 初始化（启动预热，不阻塞请求）=====
 _agent = None
 
@@ -120,20 +169,25 @@ def get_agent():
 
 
 # ===== AI 调用（异步 httpx，事件循环不堵）=====
-async def call_ai(system_prompt: str, instruction: str) -> str:
-    """httpx 异步调用 MiniMax API，事件循环始终保持响应"""
+async def call_ai(system_prompt: str, instruction: str, session_id: str = None) -> str:
+    """httpx 异步调用 AI API，session_id 相同则注入历史上下文（会话亲和）"""
     import httpx
 
-    api_key = ""
+    api_key = os.environ.get("AI_PROVIDER_API_KEY", "")
     base_url = os.environ.get("AI_PROVIDER_BASE_URL", "https://api.minimaxi.com/anthropic")
+    model = os.environ.get("A2A_MODEL", "gpt-4o")
+    max_tokens = int(os.environ.get("A2A_MAX_TOKENS", "1024"))
+
+    # .env 文件读取
     env_path = os.environ.get("A2A_ENV_PATH", ".env")
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:
-                if "AI_PROVIDER_API_KEY" in line and not line.strip().startswith("#"):
+                if line.strip().startswith("#"):
+                    continue
+                if "AI_PROVIDER_API_KEY" in line:
                     api_key = line.split("=", 1)[1].strip()
-                    break
-                if "AI_PROVIDER_BASE_URL" in line and not line.strip().startswith("#"):
+                elif "AI_PROVIDER_BASE_URL" in line:
                     base_url = line.split("=", 1)[1].strip()
 
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -146,18 +200,33 @@ async def call_ai(system_prompt: str, instruction: str) -> str:
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": os.environ.get("A2A_MODEL", "gpt-4o"),
-                "max_tokens": int(os.environ.get("A2A_MAX_TOKENS", "1024")),
+                "model": model,
+                "max_tokens": max_tokens,
                 "system": system_prompt,
-                "messages": [{"role": "user", "content": instruction}],
+                "messages": _build_messages(instruction, session_id),
             },
         )
         resp.raise_for_status()
         data = resp.json()
+        output = ""
         for item in data.get("content", []):
             if item.get("type") == "text":
-                return item.get("text", "")
-        return str(data.get("content", []))
+                output = item.get("text", "")
+        # 保存到会话历史
+        if session_id and output:
+            _session_store.append(session_id, "user", instruction)
+            _session_store.append(session_id, "assistant", output)
+        return output
+
+
+def _build_messages(instruction: str, session_id: str = None) -> list:
+    """构建 AI 消息列表：如果有历史则注入"""
+    messages = []
+    if session_id:
+        history = _session_store.get_history(session_id, limit=10)
+        messages.extend(history)
+    messages.append({"role": "user", "content": instruction})
+    return messages
 
 
 # ===== 工具函数 =====
@@ -203,8 +272,10 @@ async def create_task(request: Dict[str, Any]):
         task_id = request.get("task_id") or str(uuid.uuid4())
         timestamp = request.get("timestamp", datetime.now().isoformat())
         payload = request.get("payload", {})
+        context = payload.get("context", {})
+        session_id = payload.get("session_id") or context.get("session_id")
 
-        logger.info(f"[A2A] 收到任务: {task_id} from {from_agent} → {to_agent} ({msg_type})")
+        logger.info(f"[A2A] 收到任务: {task_id} from {from_agent} → {to_agent} ({msg_type}) session={session_id}")
 
         if msg_type != "task_delegate":
             return JSONResponse(
@@ -262,7 +333,7 @@ async def create_task(request: Dict[str, Any]):
                 "response": "pong",
                 "completed_at": datetime.now().isoformat(),
             })
-            result = {"output": "pong", "data": {"task_id": task_id}, "attachments": []}
+            result = {"output": "pong", "data": {"task_id": task_id, "session_id": session_id}, "attachments": []}
             _idempotency.set(task_id, "completed", result)
             return JSONResponse(content=make_response(
                 task_id=task_id,
@@ -273,7 +344,7 @@ async def create_task(request: Dict[str, Any]):
             ))
 
         # ===== 构建 system prompt =====
-        system_prompt = "你叫小马，是 Sid 的 AI 助手。回答简洁直接，一针见血。"
+        system_prompt = "你是 Agent A，一个 AI 助手。回答简洁直接，一针见血。"
         if context:
             system_prompt += f"\n\n附加上下文: {json.dumps(context, ensure_ascii=False)}"
 
@@ -285,7 +356,7 @@ async def create_task(request: Dict[str, Any]):
 
         # ===== AI 调用（异步，不堵事件循环）=====
         try:
-            response_text = await call_ai(system_prompt, instruction)
+            response_text = await call_ai(system_prompt, instruction, session_id)
         except Exception as ai_exc:
             import sys
             print(f"[A2A DEBUG] AI exception: {type(ai_exc).__name__}: {ai_exc}", file=sys.stderr)
@@ -295,7 +366,7 @@ async def create_task(request: Dict[str, Any]):
 
         result = {
             "output": response_text,
-            "data": {"task_id": task_id},
+            "data": {"task_id": task_id, "session_id": session_id},
             "attachments": [],
         }
 

@@ -5,9 +5,9 @@
 
 > 让两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库，最小实现，够用就行。
 
-**核心特性：** 事件循环不堵 · 幂等 · 状态机 · 异步预热 · httpx 直调 AI
+**核心特性：** 事件循环不堵 · 幂等 · 会话亲和 · 异步预热 · httpx 直调 AI
 
-**当前版本：** v2.0.0 — httpx AsyncClient 直调 AI（不再走 subprocess，冷启动问题已解决）
+**当前版本：** v2.1.0 — 新增会话亲和（session_id 相同则自动注入历史上下文）
 
 ---
 
@@ -337,7 +337,8 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | v1.0.0 | 2026-05-12 | 初始版本（subprocess 方式） |
-| **v2.0.0** | 2026-05-13 | httpx AsyncClient 直调 AI，替代 subprocess；完整幂等存储；Agent A + Agent B 双端 |
+| v2.0.0 | 2026-05-13 | httpx AsyncClient 直调 AI，替代 subprocess；完整幂等存储；Agent A + Agent B 双端 |
+| **v2.1.0** | 2026-05-13 | 会话亲和（session_id 相同则自动注入历史上下文，支持多轮对话） |
 
 ---
 
@@ -347,6 +348,7 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 - [x] API 版本协商（capabilities endpoint）— PR #4
 - [x] GitHub Actions CI 自动化测试 — PR #6
 - [x] httpx AsyncClient 直调 AI（替代 subprocess，解决冷启动）— v2.0.0
+- [x] 会话亲和（session_id 相同则自动注入历史上下文）— v2.1.0
 - [ ] 支持 WebSocket 双向推送
 - [ ] 消息持久化（SQLite 表，支持重启恢复）
 - [ ] mTLS 双向认证
