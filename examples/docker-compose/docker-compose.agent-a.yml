@@ -1,0 +1,24 @@
+# Agent A — Docker Compose 示例
+# 启动：docker-compose -f examples/docker-compose/docker-compose.agent-a.yml up -d
+
+version: "3.8"
+
+services:
+  agent-a:
+    build:
+      context: ..
+      dockerfile: examples/docker-compose/Dockerfile.agent-a
+    container_name: agent-a
+    ports:
+      - "8643:8643"
+    environment:
+      - PYTHONUNBUFFERED=1
+      # API keys 等敏感信息通过环境变量或 .env 挂载传入
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      # 挂载 .env（不要提交到 GitHub！）
+      # - ../.env:/app/.env:ro
+      - agent-a-data:/tmp
+
+volumes:
+  agent-a-data:
