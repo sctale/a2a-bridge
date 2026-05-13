@@ -321,8 +321,10 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 .
 ├── README.md              # 本文件
 ├── LICENSE               # MIT License
-├── server_side.py        # Agent A（A2A Server 模板，端口 8643）
-├── client_side.py        # Agent B（A2A Client 模板，端口 8644）
+├── server/
+│   └── server_side.py    # Agent A（A2A Server，端口 8643）
+├── client/
+│   └── client_side.py    # Agent B（A2A Client，端口 8644）
 ├── docs/
 │   ├── a2a_protocol.md   # 协议格式完整文档
 │   └── implementation.md # 核心实现细节
@@ -406,8 +408,3 @@ def _worker_loop(q):
 | 并发 | 串行执行 | 多进程并行 |
 | 状态保持 | 每次重新加载 | 子进程状态复用 |
 
----
-
-## 常见陷阱
-
-### 1. API Key 读取
