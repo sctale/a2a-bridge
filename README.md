@@ -329,6 +329,10 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 
 ## 扩展方向
 
+- [x] 健康检查探针（readiness / liveness）— PR #2
+- [x] API 版本协商（capabilities endpoint）— PR #4
+- [x] GitHub Actions CI 自动化测试 — PR #6
+- [ ] 进程池方案（方案C）— 解决 subprocess 冷启动慢问题
 - [ ] 支持 WebSocket 双向推送
 - [ ] 消息持久化（SQLite 表，支持重启恢复）
 - [ ] mTLS 双向认证
@@ -336,6 +340,70 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 
 ---
 
-## License
+## 冷启动问题与方案C（进程池）
 
-MIT
+### 问题
+
+当 Agent B 使用 subprocess 调用本地 AI CLI（如 `qwenpaw agents chat`）时：
+
+```
+A2A Request → FastAPI → asyncio.to_thread → subprocess.run(qwenpaw CLI)
+                                              ↑
+                                        每次fork，冷启动 10-120s
+```
+
+每次收到 A2A 请求都 fork 新进程，AI 模型加载需要 10-120s，导致 A2A 超时。
+
+### 方案C：进程池
+
+**核心思路：** 启动时预创建 2-3 个空闲子进程，用队列调度，AI 请求复用已有进程，消除每次 fork 的冷启动。
+
+```python
+import multiprocessing as mp
+
+# 启动时创建进程池
+_pool = None
+_task_queue = None
+
+def init_pool():
+    """在子进程中初始化 AI CLI（只加载一次）"""
+    global _pool, _task_queue
+    _task_queue = mp.Manager().Queue()
+    _pool = mp.Pool(2, initializer=_worker_init)
+
+def _worker_init():
+    """子进程启动时执行的初始化（只执行一次）"""
+    # 在这里预加载 AI 模型，避免每次请求都重新加载
+    pass
+
+def _worker_loop(q):
+    """子进程主循环，从队列取任务并处理"""
+    while True:
+        task = q.get()  # 阻塞等待
+        task_id, message = task
+        result = subprocess.run(
+            ['qwenpaw', 'agents', 'chat', '--message', message],
+            capture_output=True, text=True, timeout=120
+        )
+        q.put((task_id, parse_output(result.stdout)))
+```
+
+**关键设计：**
+- `ping` 不进队列，直接返回 pong（不走 AI）
+- `chat` 进队列，由空闲子进程处理
+- 子进程启动后一直运行，不重复 fork
+
+### 与 asyncio.to_thread 的区别
+
+| | asyncio.to_thread | 进程池 |
+|--|-------------------|--------|
+| 适用场景 | 单次/低频同步调用 | 高频/多并发 |
+| 冷启动 | 每次调用都执行 | 只在进程创建时一次 |
+| 并发 | 串行执行 | 多进程并行 |
+| 状态保持 | 每次重新加载 | 子进程状态复用 |
+
+---
+
+## 常见陷阱
+
+### 1. API Key 读取
