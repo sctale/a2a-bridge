@@ -96,9 +96,16 @@ class IdempotencyStore:
 _idempotency = IdempotencyStore()
 
 
-# ===== 会话亲和存储（SQLite）=====
+# ===== 会话亲和存储（SQLite，TTL + 阈值压缩）=====
 class SessionStore:
-    """会话历史存储：session_id → 历史消息列表，支持多轮对话上下文"""
+    """会话历史存储：session_id → 历史消息列表，支持多轮对话上下文
+
+    压缩策略：当历史超过 12 条时，保留最近 3 条 + 生成摘要压缩
+    """
+
+    COMPRESS_THRESHOLD = 12
+    KEEP_RECENT = 3
+    TTL_DAYS = 7
 
     def __init__(self, db_path: str = "/tmp/a2a_sessions.db"):
         self._lock = threading.Lock()
@@ -107,13 +114,13 @@ class SessionStore:
             CREATE TABLE IF NOT EXISTS a2a_sessions (
                 session_id TEXT PRIMARY KEY,
                 messages TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                is_compressed INTEGER NOT NULL DEFAULT 0
             )
         """)
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_updated_at ON a2a_sessions(updated_at)")
 
     def get_history(self, session_id: str, limit: int = 10) -> list:
-        """获取最近 limit 条历史消息"""
         with self._lock:
             cursor = self._db.execute(
                 "SELECT messages FROM a2a_sessions WHERE session_id = ?",
@@ -126,20 +133,44 @@ class SessionStore:
             return msgs[-limit:] if len(msgs) > limit else msgs
 
     def append(self, session_id: str, role: str, content: str, limit: int = 20):
-        """追加一条消息到会话历史"""
         with self._lock:
             cursor = self._db.execute(
-                "SELECT messages FROM a2a_sessions WHERE session_id = ?",
+                "SELECT messages, is_compressed FROM a2a_sessions WHERE session_id = ?",
                 (session_id,)
             )
             row = cursor.fetchone()
             msgs = json.loads(row[0]) if row else []
             msgs.append({"role": role, "content": content})
+
+            if len(msgs) > self.COMPRESS_THRESHOLD:
+                msgs = self._compress_rules(msgs)
+
             msgs = msgs[-limit:]
             self._db.execute(
-                "INSERT OR REPLACE INTO a2a_sessions (session_id, messages, updated_at) VALUES (?, ?, ?)",
-                (session_id, json.dumps(msgs, ensure_ascii=False), datetime.now().isoformat())
+                "INSERT OR REPLACE INTO a2a_sessions (session_id, messages, updated_at, is_compressed) VALUES (?, ?, ?, ?)",
+                (session_id, json.dumps(msgs, ensure_ascii=False), datetime.now().isoformat(), 1)
             )
+            self._db.commit()
+
+    def _compress_rules(self, msgs: list) -> list:
+        summary_parts = []
+        for m in msgs[:-self.KEEP_RECENT]:
+            if m.get("role") in ("user", "assistant"):
+                content = m["content"]
+                if len(content) > 50:
+                    content = content[:50] + "..."
+                summary_parts.append(f"{m['role']}: {content}")
+        summary = "; ".join(summary_parts[:8])
+        summary = f"[上文摘要({len(msgs)}条): {summary}]"
+        system_msgs = [m for m in msgs if m.get("role") == "system"]
+        recent = msgs[-self.KEEP_RECENT:]
+        return system_msgs + [{"role": "system", "content": summary}] + recent
+
+    def cleanup_expired(self):
+        import datetime as dt
+        cutoff = (dt.datetime.now() - dt.timedelta(days=self.TTL_DAYS)).isoformat()
+        with self._lock:
+            self._db.execute("DELETE FROM a2a_sessions WHERE updated_at < ?", (cutoff,))
             self._db.commit()
 
 _session_store = SessionStore()
