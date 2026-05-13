@@ -34,9 +34,25 @@ app = FastAPI(
 # ===== 内存任务存储 =====
 tasks: Dict[str, Dict[str, Any]] = {}
 
-# ===== 幂等存储（SQLite）=====
+# ===== httpx 全局客户端（连接池复用）=====
+_httpx_client: httpx.AsyncClient = None
+
+def get_httpx_client() -> httpx.AsyncClient:
+    """单例 httpx 客户端，连接池复用"""
+    global _httpx_client
+    if _httpx_client is None or _httpx_client.is_closed:
+        _httpx_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+    return _httpx_client
+
+
+# ===== 幂等存储（SQLite，TTL 24h，failed 可重试）=====
 class IdempotencyStore:
-    """轻量幂等存储：task_id 查重 + 结果缓存"""
+    """轻量幂等存储：task_id 查重 + TTL 缓存 + failed 可重试"""
+
+    TTL_HOURS = 24
 
     def __init__(self, db_path: str = "/tmp/agent_b_a2a_idempotency.db"):
         self._lock = threading.Lock()
@@ -46,27 +62,40 @@ class IdempotencyStore:
                 task_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 result TEXT,
+                created_at TEXT NOT NULL,
                 completed_at TEXT NOT NULL
             )
         """)
-        self._db.execute("CREATE INDEX IF NOT EXISTS idx_completed_at ON processed_tasks(completed_at)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON processed_tasks(created_at)")
 
     def get(self, task_id: str) -> Optional[Dict]:
         with self._lock:
             cursor = self._db.execute(
-                "SELECT status, result, completed_at FROM processed_tasks WHERE task_id = ?",
+                "SELECT status, result, created_at, completed_at FROM processed_tasks WHERE task_id = ?",
                 (task_id,)
             )
             row = cursor.fetchone()
-            if row:
-                return {"status": row[0], "result": json.loads(row[1]) if row[1] else None, "completed_at": row[2]}
-            return None
+            if not row:
+                return None
+            status, result_json, created_at, completed_at = row
+            if status == "failed":
+                self._db.execute("DELETE FROM processed_tasks WHERE task_id = ?", (task_id,))
+                self._db.commit()
+                return None
+            import datetime as dt
+            created = dt.datetime.fromisoformat(created_at)
+            if (dt.datetime.now() - created).total_seconds() > self.TTL_HOURS * 3600:
+                self._db.execute("DELETE FROM processed_tasks WHERE task_id = ?", (task_id,))
+                self._db.commit()
+                return None
+            return {"status": status, "result": json.loads(result_json) if result_json else None, "completed_at": completed_at}
 
     def set(self, task_id: str, status: str, result: Optional[Dict] = None):
+        now = datetime.now().isoformat()
         with self._lock:
             self._db.execute(
-                "INSERT OR REPLACE INTO processed_tasks (task_id, status, result, completed_at) VALUES (?, ?, ?, ?)",
-                (task_id, status, json.dumps(result, ensure_ascii=False), datetime.now().isoformat())
+                "INSERT OR REPLACE INTO processed_tasks (task_id, status, result, created_at, completed_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, status, json.dumps(result, ensure_ascii=False), now, now)
             )
             self._db.commit()
 
@@ -123,8 +152,18 @@ _session_store = SessionStore()
 
 
 # ===== AI 调用（异步 httpx，事件循环不堵）=====
-async def call_ai(system_prompt: str, instruction: str, session_id: str = None) -> str:
-    """httpx 异步调用 AI API，session_id 相同则注入历史上下文"""
+_TASK_TIMEOUTS = {
+    "ping": 5.0,
+    "chat": 15.0,
+    "web_search": 60.0,
+    "coding": 60.0,
+    "analysis": 60.0,
+}
+
+async def call_ai(system_prompt: str, instruction: str, session_id: str = None, task_type: str = "chat") -> str:
+    """httpx 异步调用 AI API，session_id 相同则注入历史上下文
+    按 task_type 差异化超时，错误分类重试
+    """
     api_key = os.environ.get("AI_PROVIDER_API_KEY", "")
     base_url = os.environ.get("AI_PROVIDER_BASE_URL", "https://api.minimaxi.com/anthropic")
     model = os.environ.get("A2A_MODEL", "gpt-4o")
@@ -141,32 +180,63 @@ async def call_ai(system_prompt: str, instruction: str, session_id: str = None) 
                 elif "AI_PROVIDER_BASE_URL" in line:
                     base_url = line.split("=", 1)[1].strip()
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            f"{base_url}/v1/messages",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "system": system_prompt,
-                "messages": _build_messages(instruction, session_id),
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        output = ""
-        for item in data.get("content", []):
-            if item.get("type") == "text":
-                output = item.get("text", "")
-        if session_id and output:
-            _session_store.append(session_id, "user", instruction)
-            _session_store.append(session_id, "assistant", output)
-        return output
+    timeout = _TASK_TIMEOUTS.get(task_type, 15.0)
+    messages = _build_messages(instruction, session_id)
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": messages,
+    }
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            client = get_httpx_client()
+            resp = await client.post(
+                f"{base_url}/v1/messages",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            output = ""
+            for item in data.get("content", []):
+                if item.get("type") == "text":
+                    output = item.get("text", "")
+            if session_id and output:
+                _session_store.append(session_id, "user", instruction)
+                _session_store.append(session_id, "assistant", output)
+            return output
+
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            if exc.response.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"[A2A] 429 限流，等待 {wait}s 后重试（第{attempt+1}次）")
+                await asyncio.sleep(wait)
+                continue
+            if exc.response.status_code >= 500:
+                logger.warning(f"[A2A] 服务端错误 {exc.response.status_code}，等待 1s 重试")
+                await asyncio.sleep(1)
+                continue
+            raise
+
+        except (httpx.ReadTimeout, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < 2:
+                logger.warning(f"[A2A] 网络异常 {type(exc).__name__}，等待 1s 重试")
+                await asyncio.sleep(1)
+                continue
+            raise
+
+    raise last_exc or RuntimeError("AI 调用失败")
 
 
 def _build_messages(instruction: str, session_id: str = None) -> list:
@@ -289,7 +359,7 @@ async def create_task(request: Dict[str, Any]):
         # ===== AI 调用 =====
         tasks[task_id]["status"] = "processing"
         try:
-            response_text = await call_ai(system_prompt, instruction, session_id)
+            response_text = await call_ai(system_prompt, instruction, session_id, task_type)
         except Exception as ai_exc:
             logger.exception(f"[A2A] AI 调用异常: {ai_exc}")
             response_text = f"收到: {instruction[:50]}... (AI处理异常)"
