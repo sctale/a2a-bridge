@@ -319,7 +319,7 @@ async def health():
     return {"status": "ok", "agent": "agent-a", "port": 8643}
 
 
-@app.post("/tasks")
+@app.post("/a2a")
 async def create_task(request: Dict[str, Any]):
     """
     接收任务委托，用 AI 对话处理
@@ -459,7 +459,7 @@ async def create_task(request: Dict[str, Any]):
         )
 
 
-@app.get("/tasks/{task_id}")
+@app.get("/a2a/{task_id}")
 async def get_task(task_id: str):
     """查询任务状态"""
     if task_id not in tasks:

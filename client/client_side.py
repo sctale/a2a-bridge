@@ -312,7 +312,7 @@ async def health():
         "port": int(os.environ.get("A2A_PORT", "8644"))
     }
 
-@app.post("/tasks")
+@app.post("/a2a")
 async def create_task(request: Dict[str, Any]):
     try:
         version = request.get("version", "1.0")
@@ -423,7 +423,7 @@ async def create_task(request: Dict[str, Any]):
             ),
         )
 
-@app.get("/tasks/{task_id}")
+@app.get("/a2a/{task_id}")
 async def get_task(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
