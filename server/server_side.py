@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Agent A2A Server Template
+Agent A2A Server — v2.2.0
 Receives task delegations and processes with AI
+httpx AsyncClient 直调 AI，替代 subprocess
 """
 import asyncio
 import json
@@ -20,6 +21,7 @@ sys.path.insert(0, os.path.join(os.environ.get("HERMES_PATH", "/opt/hermes"), ".
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+import httpx
 import uvicorn
 
 # ===== 日志 =====
@@ -27,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("a2a_server")
 
 # ===== FastAPI App =====
-app = FastAPI(title="Agent A2A Server", version="2.1.0")
+app = FastAPI(title="Agent A2A Server", version="2.2.0")
 
 # ===== 内存任务存储 =====
 tasks: Dict[str, Dict[str, Any]] = {}
@@ -176,53 +178,7 @@ class SessionStore:
 _session_store = SessionStore()
 
 
-# ===== AI Agent 初始化（启动预热，不阻塞请求）=====
-_agent = None
-
-@app.on_event("startup")
-async def startup():
-    """启动时异步预热 AI Agent，不阻塞请求"""
-    asyncio.create_task(preload_agent())
-
-async def preload_agent():
-    """后台预加载 AI Agent"""
-    global _agent
-    try:
-        logger.info("[A2A] 预热 AI Agent 中...")
-        _agent = await asyncio.to_thread(load_agent_sync)
-        logger.info("[A2A] AI Agent 预热完成")
-    except Exception as exc:
-        logger.exception(f"[A2A] AI Agent 预热失败: {exc}")
-
-def load_agent_sync():
-    """同步加载 AIAgent（运行在线程池中）"""
-    from run_agent import AIAgent
-    from hermes_cli.config import load_config
-
-    config = load_config()
-    model_cfg = config.get("model", {})
-
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    base_url = os.environ.get("OPENAI_BASE_URL", "") or model_cfg.get("base_url", "")
-    model = model_cfg.get("model", "gpt-4o")
-    provider = model_cfg.get("provider", "openai")
-
-    return AIAgent(
-        base_url=base_url,
-        api_key=api_key,
-        provider=provider,
-        model=model,
-        platform="a2a",
-        skip_memory=False,
-        skip_context_files=True,
-    )
-
-def get_agent():
-    """懒加载，返回已预热或已加载的 Agent"""
-    return _agent
-
-
-# ===== httpx 全局客户端（连接池复用）=====
+# ===== httpx 全局客户端（连接池复用）=======
 _httpx_client: httpx.AsyncClient = None
 
 def get_httpx_client() -> httpx.AsyncClient:
@@ -249,8 +205,6 @@ async def call_ai(system_prompt: str, instruction: str, session_id: str = None, 
     """httpx 异步调用 AI API，session_id 相同则注入历史上下文
     按 task_type 差异化超时，错误分类重试
     """
-    import httpx
-
     api_key = os.environ.get("AI_PROVIDER_API_KEY", "")
     base_url = os.environ.get("AI_PROVIDER_BASE_URL", "https://api.minimaxi.com/anthropic")
     model = os.environ.get("A2A_MODEL", "gpt-4o")

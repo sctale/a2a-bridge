@@ -1,13 +1,13 @@
 # A2A Bridge — 轻量级多 Agent 通信框架
 
-[![Version](https://img.shields.io/badge/version-v2.0.0-blue)](https://github.com/sctale/a2a-bridge/releases)
+[![Version](https://img.shields.io/badge/version-v2.2.0-blue)](https://github.com/sctale/a2a-bridge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > 让两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库，最小实现，够用就行。
 
 **核心特性：** 事件循环不堵 · 幂等 · 会话亲和 · 异步预热 · httpx 直调 AI
 
-**当前版本：** v2.1.0 — 新增会话亲和（session_id 相同则自动注入历史上下文）
+**当前版本：** v2.2.0 — httpx AsyncClient 全局连接池 + 差异化超时 + 错误分类重试
 
 ---
 
@@ -19,7 +19,7 @@
 │  ┌─────────────────────────────────────────────────┐   │
 │  │  FastAPI Server  :8643                          │   │
 │  │  POST /tasks     → AI 对话处理                  │   │
-│  │  GET  /health    → 健康检查                      │   │
+│  │  GET  /health   → 健康检查                      │   │
 │  │  GET  /tasks/{id} → 任务状态查询                 │   │
 │  └─────────────────────────────────────────────────┘   │
 └───────────────────────┬─────────────────────────────────┘
@@ -29,7 +29,7 @@
 │  Agent B (QwenPaw / Claude / Any Agent)                  │
 │  ┌─────────────────────────────────────────────────┐   │
 │  │  FastAPI Server  :8644                          │   │
-│  │  POST /a2a       → AI 对话处理                  │   │
+│  │  POST /tasks     → AI 对话处理                  │   │
 │  │  GET  /health    → 健康检查                      │   │
 │  │  GET  /tasks/{id} → 任务状态查询                 │   │
 │  └─────────────────────────────────────────────────┘   │
@@ -67,10 +67,9 @@ python client_side.py
 ```
 
 ### 4. 验证连通性
-
 ```bash
 # A → B：ping
-curl -X POST http://localhost:8644/a2a \
+curl -X POST http://localhost:8644/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "version": "1.0",
@@ -85,7 +84,7 @@ curl -X POST http://localhost:8644/a2a \
   }'
 
 # A → B：对话
-curl -X POST http://localhost:8644/a2a \
+curl -X POST http://localhost:8644/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "version": "1.0",
@@ -316,41 +315,38 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 ---
 
 ## 目录结构
-
 ```
 .
 ├── README.md              # 本文件
 ├── LICENSE               # MIT License
+├── requirements.txt      # 依赖
 ├── server/
-│   └── server_side.py    # Agent A（A2A Server，端口 8643）
+│   ├── __init__.py
+│   └── server_side.py   # Agent A（A2A Server，端口 8643）
 ├── client/
-│   └── client_side.py    # Agent B（A2A Client，端口 8644）
-├── docs/
-│   ├── a2a_protocol.md   # 协议格式完整文档
-│   └── implementation.md # 核心实现细节
+│   ├── __init__.py
+│   └── client_side.py   # Agent B（A2A Server，端口 8644）
 └── examples/
-    └── docker-compose/   # Docker 部署示例
+    └── docker-compose/  # Docker 部署示例
 ```
 
 ---
 
 ## 版本历史
-
+## 版本历史
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | v1.0.0 | 2026-05-12 | 初始版本（subprocess 方式） |
 | v2.0.0 | 2026-05-13 | httpx AsyncClient 直调 AI，替代 subprocess；完整幂等存储；Agent A + Agent B 双端 |
 | **v2.1.0** | 2026-05-13 | 会话亲和（session_id 相同则自动注入历史上下文，支持多轮对话） |
-
----
+| **v2.2.0** | 2026-05-13 | httpx 全局连接池 + 差异化超时（ping 5s/chat 15s/search 60s）+ 错误分类重试（429 指数退避 / 500 等1s / 4xx 不重试）+ 幂等 TTL 24h |
 
 ## 扩展方向
 
-- [x] 健康检查探针（readiness / liveness）— PR #2
-- [x] API 版本协商（capabilities endpoint）— PR #4
-- [x] GitHub Actions CI 自动化测试 — PR #6
+- [x] 健康检查探针（readiness / liveness）
 - [x] httpx AsyncClient 直调 AI（替代 subprocess，解决冷启动）— v2.0.0
 - [x] 会话亲和（session_id 相同则自动注入历史上下文）— v2.1.0
+- [x] httpx 全局连接池 + 差异化超时 + 错误分类重试 — v2.2.0
 - [ ] 支持 WebSocket 双向推送
 - [ ] 消息持久化（SQLite 表，支持重启恢复）
 - [ ] mTLS 双向认证
@@ -358,53 +354,44 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 
 ---
 
-## httpx 直调 AI 方案（v2.0.0）
+## httpx 直调 AI 方案（v2.0.0+）
 
-### 问题
+### 核心思路
 
-当 Agent 使用 subprocess 调用本地 AI CLI（如 `qwenpaw agents chat`）时，每次收到 A2A 请求都 fork 新进程，AI 模型加载需要 10-120s，导致 A2A 超时。
+Agent 在收到 A2A 请求时，直接用 `httpx.AsyncClient` 调 AI Provider API，不 fork 子进程，不阻塞事件循环。
 
 ```python
-import multiprocessing as mp
+# httpx 全局客户端（连接池复用）
+_httpx_client: httpx.AsyncClient = None
 
-# 启动时创建进程池
-_pool = None
-_task_queue = None
-
-def init_pool():
-    """在子进程中初始化 AI CLI（只加载一次）"""
-    global _pool, _task_queue
-    _task_queue = mp.Manager().Queue()
-    _pool = mp.Pool(2, initializer=_worker_init)
-
-def _worker_init():
-    """子进程启动时执行的初始化（只执行一次）"""
-    # 在这里预加载 AI 模型，避免每次请求都重新加载
-    pass
-
-def _worker_loop(q):
-    """子进程主循环，从队列取任务并处理"""
-    while True:
-        task = q.get()  # 阻塞等待
-        task_id, message = task
-        result = subprocess.run(
-            ['qwenpaw', 'agents', 'chat', '--message', message],
-            capture_output=True, text=True, timeout=120
+def get_httpx_client() -> httpx.AsyncClient:
+    global _httpx_client
+    if _httpx_client is None or _httpx_client.is_closed:
+        _httpx_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
-        q.put((task_id, parse_output(result.stdout)))
+    return _httpx_client
+
+# AI 调用（异步 httpx，事件循环不堵）
+async def call_ai(system_prompt, instruction, session_id=None, task_type="chat") -> str:
+    client = get_httpx_client()
+    resp = await client.post(
+        f"{base_url}/v1/messages",
+        headers={"Authorization": f"Bearer {api_key}", ...},
+        json={"model": model, "messages": [...], "system": system_prompt},
+        timeout=_TASK_TIMEOUTS.get(task_type, 15.0),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["content"][0]["text"]
 ```
 
-**关键设计：**
-- `ping` 不进队列，直接返回 pong（不走 AI）
-- `chat` 进队列，由空闲子进程处理
-- 子进程启动后一直运行，不重复 fork
+### 关键设计
 
-### 与 asyncio.to_thread 的区别
+- **ping 提前返回**：`task_type == "ping"` 在任何 AI 调用之前判断，不走 httpx
+- **差异化超时**：ping 5s / chat 15s / search 60s
+- **错误分类重试**：429 指数退避 / 500 等1s / 4xx 直接抛
+- **连接池复用**：`max_connections=100, max_keepalive=20`，高并发不重建连接
 
-| | asyncio.to_thread | 进程池 |
-|--|-------------------|--------|
-| 适用场景 | 单次/低频同步调用 | 高频/多并发 |
-| 冷启动 | 每次调用都执行 | 只在进程创建时一次 |
-| 并发 | 串行执行 | 多进程并行 |
-| 状态保持 | 每次重新加载 | 子进程状态复用 |
 

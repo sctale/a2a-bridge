@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Agent B A2A Server — v2.0.0
+Agent B A2A Server — v2.2.0
 Receives task delegations from Agent A, processes with AI, returns results.
 脱敏版：环境变量控制所有敏感配置
+httpx AsyncClient 直调 AI，替代 subprocess
 """
 import asyncio
 import json
@@ -27,7 +28,7 @@ logger = logging.getLogger("agent_b_a2a")
 # ===== FastAPI App =====
 app = FastAPI(
     title="Agent B A2A Server",
-    version="2.0.0",
+    version="2.2.0",
     description="Receives task delegations and processes with AI"
 )
 
