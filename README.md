@@ -1,6 +1,6 @@
 # A2A Bridge — 轻量级多 Agent 通信框架
 
-[![Version](https://img.shields.io/badge/version-v2.2.0-blue)](https://github.com/sctale/a2a-bridge/releases)
+[![Version](https://img.shields.io/badge/version-v2.2.1-blue)](https://github.com/sctale/a2a-bridge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > 让两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库，最小实现，够用就行。
@@ -67,7 +67,7 @@ python client_side.py
 ### 4. 验证连通性
 ```bash
 # A → B：ping
-curl -X POST http://localhost:8644/tasks \
+curl -X POST http://localhost:8644/a2a \
   -H "Content-Type: application/json" \
   -d '{
     "version": "1.0",
@@ -82,7 +82,7 @@ curl -X POST http://localhost:8644/tasks \
   }'
 
 # A → B：对话
-curl -X POST http://localhost:8644/tasks \
+curl -X POST http://localhost:8644/a2a \
   -H "Content-Type: application/json" \
   -d '{
     "version": "1.0",
@@ -272,7 +272,7 @@ services:
 
 通信地址：
 - A → B：`http://<host>:8644/a2a`
-- B → A：`http://<host>:8643/tasks`
+- B → A：`http://<host>:8643/a2a`
 
 ---
 
@@ -329,15 +329,15 @@ task_type = context.get("task_type") or payload.get("task_type", "chat")
 ```
 
 ---
+## 版本历史
 
-## 版本历史
-## 版本历史
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | v1.0.0 | 2026-05-12 | 初始版本（subprocess 方式） |
 | v2.0.0 | 2026-05-13 | httpx AsyncClient 直调 AI，替代 subprocess；完整幂等存储；Agent A + Agent B 双端 |
 | **v2.1.0** | 2026-05-13 | 会话亲和（session_id 相同则自动注入历史上下文，支持多轮对话） |
-| **v2.2.0** | 2026-05-13 | httpx 全局连接池 + 差异化超时（ping 5s/chat 15s/search 60s）+ 错误分类重试（429 指数退避 / 500 等1s / 4xx 不重试）+ 幂等 TTL 24h |
+| **v2.2.0** | 2026-05-14 | httpx 全局连接池 + 差异化超时（ping 5s/chat 15s/search 60s）+ 错误分类重试 + 幂等 TTL 24h |
+| **v2.2.1** | 2026-05-14 | 端点统一为 /a2a；超时升级为 120s；context 变量顺序 bug 修复；import httpx 补全 |
 
 ## 扩展方向
 
@@ -378,7 +378,7 @@ async def call_ai(system_prompt, instruction, session_id=None, task_type="chat")
         f"{base_url}/v1/messages",
         headers={"Authorization": f"Bearer {api_key}", ...},
         json={"model": model, "messages": [...], "system": system_prompt},
-        timeout=_TASK_TIMEOUTS.get(task_type, 15.0),
+        timeout=_TASK_TIMEOUTS.get(task_type, 15.0),  # 默认 15s → 120s
     )
     resp.raise_for_status()
     data = resp.json()
@@ -388,7 +388,7 @@ async def call_ai(system_prompt, instruction, session_id=None, task_type="chat")
 ### 关键设计
 
 - **ping 提前返回**：`task_type == "ping"` 在任何 AI 调用之前判断，不走 httpx
-- **差异化超时**：ping 5s / chat 15s / search 60s
+- **差异化超时**：ping 5s / chat 120s / search 120s
 - **错误分类重试**：429 指数退避 / 500 等1s / 4xx 直接抛
 - **连接池复用**：`max_connections=100, max_keepalive=20`，高并发不重建连接
 

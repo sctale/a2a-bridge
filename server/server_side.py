@@ -65,10 +65,12 @@ class IdempotencyStore:
             if not row:
                 return None
             status, result_json, created_at, completed_at = row
+            # failed 缓存直接删掉，允许重试
             if status == "failed":
                 self._db.execute("DELETE FROM processed_tasks WHERE task_id = ?", (task_id,))
                 self._db.commit()
                 return None
+            # 检查 TTL 是否过期
             import datetime as dt
             created = dt.datetime.fromisoformat(created_at)
             if (dt.datetime.now() - created).total_seconds() > self.TTL_HOURS * 3600:
@@ -88,7 +90,7 @@ class IdempotencyStore:
             self._db.commit()
 
     def cleanup_expired(self):
-        """清理过期缓存"""
+        """清理过期缓存（TTL 到期的 completed 记录）"""
         import datetime as dt
         cutoff = (dt.datetime.now() - dt.timedelta(hours=self.TTL_HOURS)).isoformat()
         with self._lock:
@@ -98,16 +100,62 @@ class IdempotencyStore:
 _idempotency = IdempotencyStore()
 
 
-# ===== 会话亲和存储（SQLite，TTL + 阈值压缩）=====
+# ===== AI Agent 初始化（启动预热，不阻塞请求）=====
+_agent = None
+
+@app.on_event("startup")
+async def startup():
+    """启动时异步预热 AI Agent，不阻塞请求"""
+    asyncio.create_task(preload_agent())
+
+async def preload_agent():
+    """后台预加载 AI Agent"""
+    global _agent
+    try:
+        logger.info("[A2A] 预热 AI Agent 中...")
+        _agent = await asyncio.to_thread(load_agent_sync)
+        logger.info("[A2A] AI Agent 预热完成")
+    except Exception as exc:
+        logger.exception(f"[A2A] AI Agent 预热失败: {exc}")
+
+def load_agent_sync():
+    """同步加载 AIAgent（运行在线程池中）"""
+    from run_agent import AIAgent
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    model_cfg = config.get("model", {})
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    base_url = os.environ.get("OPENAI_BASE_URL", "") or model_cfg.get("base_url", "")
+    model = model_cfg.get("model", "gpt-4o")
+    provider = model_cfg.get("provider", "openai")
+
+    return AIAgent(
+        base_url=base_url,
+        api_key=api_key,
+        provider=provider,
+        model=model,
+        platform="a2a",
+        skip_memory=False,
+        skip_context_files=True,
+    )
+
+def get_agent():
+    """懒加载，返回已预热或已加载的 Agent"""
+    return _agent
+
+
+# ===== 会话亲和存储（SQLite，TTL 24h + 阈值压缩）=====
 class SessionStore:
     """会话历史存储：session_id → 历史消息列表，支持多轮对话上下文
 
     压缩策略：当历史超过 12 条时，保留最近 3 条 + 生成摘要压缩
     """
 
-    COMPRESS_THRESHOLD = 12
-    KEEP_RECENT = 3
-    TTL_DAYS = 7
+    COMPRESS_THRESHOLD = 12   # 超过此条数触发压缩
+    KEEP_RECENT = 3           # 压缩后保留最近 N 条
+    TTL_DAYS = 7              # session 7 天未更新则过期删除
 
     def __init__(self, db_path: str = "/tmp/a2a_sessions.db"):
         self._lock = threading.Lock()
@@ -123,6 +171,7 @@ class SessionStore:
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_updated_at ON a2a_sessions(updated_at)")
 
     def get_history(self, session_id: str, limit: int = 10) -> list:
+        """获取最近 limit 条历史消息"""
         with self._lock:
             cursor = self._db.execute(
                 "SELECT messages FROM a2a_sessions WHERE session_id = ?",
@@ -135,6 +184,7 @@ class SessionStore:
             return msgs[-limit:] if len(msgs) > limit else msgs
 
     def append(self, session_id: str, role: str, content: str, limit: int = 20):
+        """追加一条消息到会话历史，超过阈值时自动规则压缩"""
         with self._lock:
             cursor = self._db.execute(
                 "SELECT messages, is_compressed FROM a2a_sessions WHERE session_id = ?",
@@ -144,9 +194,11 @@ class SessionStore:
             msgs = json.loads(row[0]) if row else []
             msgs.append({"role": role, "content": content})
 
+            # 超过阈值 → 压缩
             if len(msgs) > self.COMPRESS_THRESHOLD:
                 msgs = self._compress_rules(msgs)
 
+            # 只保留最近 limit 条
             msgs = msgs[-limit:]
             self._db.execute(
                 "INSERT OR REPLACE INTO a2a_sessions (session_id, messages, updated_at, is_compressed) VALUES (?, ?, ?, ?)",
@@ -155,20 +207,26 @@ class SessionStore:
             self._db.commit()
 
     def _compress_rules(self, msgs: list) -> list:
+        """规则压缩：保留系统消息 + 最近 K 条 + 摘要"""
+        # 提取摘要：把所有"user"和"assistant"内容拼接后压缩
         summary_parts = []
         for m in msgs[:-self.KEEP_RECENT]:
             if m.get("role") in ("user", "assistant"):
                 content = m["content"]
+                # 截断每条到 50 字
                 if len(content) > 50:
                     content = content[:50] + "..."
                 summary_parts.append(f"{m['role']}: {content}")
-        summary = "; ".join(summary_parts[:8])
+        summary = "; ".join(summary_parts[:8])  # 最多 8 条
         summary = f"[上文摘要({len(msgs)}条): {summary}]"
+
+        # 保留：系统消息 + 摘要 + 最近 K 条
         system_msgs = [m for m in msgs if m.get("role") == "system"]
         recent = msgs[-self.KEEP_RECENT:]
         return system_msgs + [{"role": "system", "content": summary}] + recent
 
     def cleanup_expired(self):
+        """清理过期 session（7 天未更新）"""
         import datetime as dt
         cutoff = (dt.datetime.now() - dt.timedelta(days=self.TTL_DAYS)).isoformat()
         with self._lock:
@@ -178,7 +236,7 @@ class SessionStore:
 _session_store = SessionStore()
 
 
-# ===== httpx 全局客户端（连接池复用）=======
+# ===== httpx 全局客户端（连接池复用）=====
 _httpx_client: httpx.AsyncClient = None
 
 def get_httpx_client() -> httpx.AsyncClient:
@@ -201,27 +259,34 @@ _TASK_TIMEOUTS = {
     "analysis": 120.0,
 }
 
+def _should_retry(exc: Exception, attempt: int) -> bool:
+    """判断是否重试：429 指数退避，500 等1s，4xx 不重试"""
+    if attempt >= 3:
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code == 429:
+            return True  # 指数退避由调用方控制
+        if code >= 500:
+            return True  # 服务端错误，等1s后重试
+        return False  # 4xx 不重试
+    if isinstance(exc, (httpx.ReadTimeout, httpx.ConnectError)):
+        return attempt < 2  # 网络抖动，最多2次
+    return False
+
+
 async def call_ai(system_prompt: str, instruction: str, session_id: str = None, task_type: str = "chat") -> str:
-    """httpx 异步调用 AI API，session_id 相同则注入历史上下文
-    按 task_type 差异化超时，错误分类重试
+    """httpx 异步调用 AI API，session_id 相同则注入历史上下文（会话亲和）
+    按 task_type 差异化超时：ping=5s, chat=120s, web_search/coding/analysis=120s
+    错误分类重试：429 指数退避，500 等1s，4xx 不重试
     """
     api_key = os.environ.get("AI_PROVIDER_API_KEY", "")
     base_url = os.environ.get("AI_PROVIDER_BASE_URL", "https://api.minimaxi.com/anthropic")
     model = os.environ.get("A2A_MODEL", "gpt-4o")
     max_tokens = int(os.environ.get("A2A_MAX_TOKENS", "1024"))
 
-    env_path = os.environ.get("A2A_ENV_PATH", ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                if line.strip().startswith("#"):
-                    continue
-                if "AI_PROVIDER_API_KEY" in line:
-                    api_key = line.split("=", 1)[1].strip()
-                elif "AI_PROVIDER_BASE_URL" in line:
-                    base_url = line.split("=", 1)[1].strip()
-
     timeout = _TASK_TIMEOUTS.get(task_type, 15.0)
+
     messages = _build_messages(instruction, session_id)
     payload = {
         "model": model,
@@ -230,6 +295,7 @@ async def call_ai(system_prompt: str, instruction: str, session_id: str = None, 
         "messages": messages,
     }
 
+    # 重试循环：429 指数退避(1s→2s→4s→8s)，500 等1s，4xx 不重试
     last_exc = None
     for attempt in range(3):
         try:
@@ -251,6 +317,7 @@ async def call_ai(system_prompt: str, instruction: str, session_id: str = None, 
             for item in data.get("content", []):
                 if item.get("type") == "text":
                     output = item.get("text", "")
+            # 保存到会话历史
             if session_id and output:
                 _session_store.append(session_id, "user", instruction)
                 _session_store.append(session_id, "assistant", output)
@@ -264,19 +331,21 @@ async def call_ai(system_prompt: str, instruction: str, session_id: str = None, 
                 await asyncio.sleep(wait)
                 continue
             if exc.response.status_code >= 500:
-                logger.warning(f"[A2A] 服务端错误 {exc.response.status_code}，等待 1s 重试")
+                logger.warning(f"[A2A] 服务端错误 {exc.response.status_code}，等待 1s 重试（第{attempt+1}次）")
                 await asyncio.sleep(1)
                 continue
+            # 4xx 不重试，直接抛
             raise
 
         except (httpx.ReadTimeout, httpx.ConnectError) as exc:
             last_exc = exc
             if attempt < 2:
-                logger.warning(f"[A2A] 网络异常 {type(exc).__name__}，等待 1s 重试")
+                logger.warning(f"[A2A] 网络异常 {type(exc).__name__}，等待 1s 重试（第{attempt+1}次）")
                 await asyncio.sleep(1)
                 continue
             raise
 
+    # 重试耗尽
     raise last_exc or RuntimeError("AI 调用失败")
 
 
@@ -316,7 +385,7 @@ def make_response(
 @app.get("/health")
 async def health():
     """健康检查"""
-    return {"status": "ok", "agent": "agent-a", "port": 8643}
+    return {"status": "ok", "agent": "agent-a", "port": int(os.environ.get("A2A_PORT", "8643"))}
 
 
 @app.post("/a2a")
@@ -333,9 +402,11 @@ async def create_task(request: Dict[str, Any]):
         task_id = request.get("task_id") or str(uuid.uuid4())
         timestamp = request.get("timestamp", datetime.now().isoformat())
         payload = request.get("payload", {})
+
+        # 关键：先取 instruction 和 context，再从中取 session_id（避免引用未定义变量）
+        instruction = payload.get("instruction", "")
         context = payload.get("context", {})
         session_id = payload.get("session_id") or context.get("session_id")
-
         logger.info(f"[A2A] 收到任务: {task_id} from {from_agent} → {to_agent} ({msg_type}) session={session_id}")
 
         if msg_type != "task_delegate":
@@ -358,8 +429,6 @@ async def create_task(request: Dict[str, Any]):
                 ),
             )
 
-        instruction = payload.get("instruction", "")
-        context = payload.get("context", {})
         # task_type 可能藏在 context 里（跨 agent 消息格式）
         task_type = context.get("task_type") or payload.get("task_type", "chat")
 
@@ -421,24 +490,32 @@ async def create_task(request: Dict[str, Any]):
         except Exception as ai_exc:
             import sys
             print(f"[A2A DEBUG] AI exception: {type(ai_exc).__name__}: {ai_exc}", file=sys.stderr)
-            response_text = f"收到: {instruction[:50]}... (AI处理异常)"
+            tasks[task_id].update({
+                "status": "failed",
+                "response": None,
+                "completed_at": datetime.now().isoformat(),
+            })
+            error_result = {"code": 500, "message": f"AI调用失败: {type(ai_exc).__name__}: {str(ai_exc)}"}
+            _idempotency.set(task_id, "failed", None)
+            return JSONResponse(
+                status_code=200,
+                content=make_response(
+                    task_id=task_id,
+                    status="failed",
+                    error=error_result,
+                    from_agent=os.environ.get("AGENT_NAME", "agent-a"),
+                    to_agent=from_agent,
+                ),
+            )
 
-        logger.info(f"[A2A] AI 响应: {response_text[:80]}...")
-
-        result = {
-            "output": response_text,
-            "data": {"task_id": task_id, "session_id": session_id},
-            "attachments": [],
-        }
-
-        # ===== 完成任务 =====
+        # ===== 成功 =====
         tasks[task_id].update({
             "status": "completed",
             "response": response_text,
             "completed_at": datetime.now().isoformat(),
         })
+        result = {"output": response_text, "data": {"task_id": task_id, "session_id": session_id}, "attachments": []}
         _idempotency.set(task_id, "completed", result)
-
         return JSONResponse(content=make_response(
             task_id=task_id,
             status="success",
@@ -448,9 +525,10 @@ async def create_task(request: Dict[str, Any]):
         ))
 
     except Exception as exc:
-        logger.exception(f"[A2A] 处理任务异常: {exc}")
+        import sys
+        print(f"[A2A DEBUG] Unhandled exception: {type(exc).__name__}: {exc}", file=sys.stderr)
         return JSONResponse(
-            status_code=500,
+            status_code=200,
             content=make_response(
                 task_id=request.get("task_id", "unknown"),
                 status="failed",
@@ -464,10 +542,21 @@ async def get_task(task_id: str):
     """查询任务状态"""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
-    return tasks[task_id]
+    task = tasks[task_id]
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "created_at": task["created_at"],
+        "from": task.get("from"),
+        "task_type": task.get("task_type"),
+        "instruction": task.get("instruction"),
+        "response": task.get("response"),
+        "started_at": task.get("started_at"),
+        "completed_at": task.get("completed_at"),
+        "error": None,
+    }
 
 
-# ===== 启动 =====
 if __name__ == "__main__":
     uvicorn.run(
         app,
