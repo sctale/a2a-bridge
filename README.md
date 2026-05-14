@@ -378,7 +378,7 @@ async def call_ai(system_prompt, instruction, session_id=None, task_type="chat")
         f"{base_url}/v1/messages",
         headers={"Authorization": f"Bearer {api_key}", ...},
         json={"model": model, "messages": [...], "system": system_prompt},
-        timeout=_TASK_TIMEOUTS.get(task_type, 15.0),  # 默认 15s → 120s
+        timeout=_TASK_TIMEOUTS.get(task_type, 120.0),
     )
     resp.raise_for_status()
     data = resp.json()
