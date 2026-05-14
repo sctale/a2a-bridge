@@ -195,10 +195,10 @@ def get_httpx_client() -> httpx.AsyncClient:
 # ===== AI 调用（异步 httpx，事件循环不堵）=====
 _TASK_TIMEOUTS = {
     "ping": 5.0,
-    "chat": 15.0,
-    "web_search": 60.0,
-    "coding": 60.0,
-    "analysis": 60.0,
+    "chat": 120.0,
+    "web_search": 120.0,
+    "coding": 120.0,
+    "analysis": 120.0,
 }
 
 async def call_ai(system_prompt: str, instruction: str, session_id: str = None, task_type: str = "chat") -> str:
