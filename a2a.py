@@ -85,7 +85,7 @@ logger.info(f"[{MY_NAME}] 启动 A2A Bridge，port={MY_PORT} peer={MY_PEER_URL o
 # ─── FastAPI App ──────────────────────────────────────────────────────
 app = FastAPI(
     title=f"A2A Bridge — {MY_NAME}",
-    version="3.0.0",
+    version="1.0.0",
     description="通用双向 Agent 通信节点",
 )
 
@@ -373,7 +373,7 @@ async def health():
         "name": MY_NAME,
         "port": MY_PORT,
         "peer": MY_PEER_URL or None,
-        "version": "3.0.0",
+        "version": "1.0.0",
     }
 
 
@@ -393,7 +393,7 @@ async def live():
 async def capabilities():
     """返回支持的特性"""
     return {
-        "version": "3.0.0",
+        "version": "1.0.0",
         "features": {
             "idempotency": True,
             "session_affinity": True,

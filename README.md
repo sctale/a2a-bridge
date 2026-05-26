@@ -1,6 +1,6 @@
-# A2A Bridge — 通用双向 Agent 通信框架 v3.0.0
+# A2A Bridge — 通用双向 Agent 通信框架 v1.0.0
 
-[![Version](https://img.shields.io/badge/version-v3.0.0-blue)](https://github.com/sctale/a2a-bridge/releases)
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](https://github.com/sctale/a2a-bridge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > 让任意两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库。
@@ -198,12 +198,11 @@ services:
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-| v1.0.0 | 2026-05-12 | 初始版本（subprocess 方式） |
-| v2.0.0 | 2026-05-13 | httpx AsyncClient 直调 AI，完整幂等存储 |
-| v2.1.0 | 2026-05-13 | 会话亲和（session_id 相同自动注入历史上下文） |
-| v2.2.0 | 2026-05-14 | httpx 全局连接池 + 差异化超时 + 错误分类重试 |
-| v2.2.1 | 2026-05-14 | 端点统一 /a2a，超时升级 120s，bug 修复 |
-| **v3.0.0** | 2026-05-26 | **一体化设计：去掉 server/client 区分，一个 py 文件通用** |
+| **v1.0.0** | 2026-05-26 | **一体化通用版本** — 一个 py 文件，`A2A_PORT`+`A2A_PEER_URL` 开箱即用，不分 client/server；/send 主动发送端点；K8s 探针 |
+| v0.2.2.1 | 2026-05-14 | httpx 全局连接池 + 差异化超时 + 错误分类重试 |
+| v0.2.1.0 | 2026-05-13 | 会话亲和（session_id 相同自动注入历史上下文） |
+| v0.2.0.0 | 2026-05-13 | httpx AsyncClient 直调 AI，替代 subprocess；完整幂等存储 |
+| v0.1.0.0 | 2026-05-12 | 初始版本（subprocess 方式） |
 
 ---
 
