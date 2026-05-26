@@ -187,9 +187,7 @@ services:
 ├── README.md
 ├── LICENSE
 ├── requirements.txt
-├── a2a.py              # 一体化主程序（server + client + AI 调用）
-└── examples/
-    └── docker-compose/  # Docker 部署示例
+└── a2a.py              # 一体化主程序（接收 + 发送 + AI 调用）
 ```
 
 ---
