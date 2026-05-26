@@ -1,10 +1,11 @@
-# A2A Bridge — 通用双向 Agent 通信框架 v1.0.0
+# A2A Bridge — 通用双向 Agent 通信框架 v1.1.0
 
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](https://github.com/sctale/a2a-bridge/releases)
+[![Version](https://img.shields.io/badge/version-v1.1.0-blue)](https://github.com/sctale/a2a-bridge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > 让任意两个 AI Agent 通过 HTTP+JSON 互相通信，无需依赖第三方 A2A 库。
 > **一体化开箱即用**：每个实例既是 Server 也是 Client，只配一个端口和对方地址即可。
+> **v1.1.0**：基于官方 A2A Protocol Agent Card + 客户端认证机制。
 
 ---
 
@@ -33,7 +34,8 @@ pip install fastapi uvicorn httpx
 ```bash
 A2A_PORT=8643 \
 A2A_PEER_URL=http://localhost:8644 \
-AI_PROVIDER_API_KEY=sk-xxx \
+AI_PROVIDER_BASE_URL=https://api.minimaxi.com/anthropic \
+A2A_MODEL=gpt-4o \
 python a2a.py
 ```
 
@@ -42,16 +44,21 @@ python a2a.py
 ```bash
 A2A_PORT=8644 \
 A2A_PEER_URL=http://localhost:8643 \
-AI_PROVIDER_API_KEY=sk-xxx \
+AI_PROVIDER_BASE_URL=https://api.minimaxi.com/anthropic \
+A2A_MODEL=gpt-4o \
 python a2a.py
 ```
 
 ### 4. 验证
 
 ```bash
-# A ← B：ping
+# 获取 Agent Card（了解节点能力）
+curl http://localhost:8643/.well-known/agent-card.json
+
+# A ← B：ping（ping 不需要 AI Key）
 curl -X POST http://localhost:8643/a2a \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "version": "1.0",
     "type": "task_delegate",
@@ -61,15 +68,88 @@ curl -X POST http://localhost:8643/a2a \
     "payload": {"task_type": "ping", "instruction": ""}
   }'
 
-# A → B：主动发送
+# A ← B：chat（需要 AI Key）
+curl -X POST http://localhost:8643/a2a \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "version": "1.0",
+    "type": "task_delegate",
+    "from": "node-b",
+    "to": "node-8643",
+    "task_id": "chat-test",
+    "payload": {
+      "task_type": "chat",
+      "instruction": "你好，介绍一下你自己",
+      "session_id": "sess-001"
+    }
+  }'
+
+# A → B：主动发送（通过 /send 端点）
 curl -X POST http://localhost:8644/send \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "task_type": "chat",
     "instruction": "你好，介绍一下你自己",
     "session_id": "sess-001"
   }'
 ```
+
+---
+
+## Agent Card 机制（v1.1.0 新增）
+
+A2A Protocol 规定每个 Agent 必须公开自己的元数据（Agent Card），客户端通过 Agent Card 发现和了解 Agent。
+
+### Agent Card 端点
+
+| 路径 | 说明 |
+|------|------|
+| `GET /.well-known/agent-card.json` | 官方标准路径 |
+| `GET /a2a/.well-known/agent-card.json` | A2A 官方路径别名（兼容官方客户端） |
+
+### Agent Card 示例
+
+```json
+{
+  "name": "node-8643",
+  "description": "A2A Bridge Agent — node-8643，支持 ping/chat/web_search/coding/analysis 任务类型",
+  "url": "http://localhost:8643",
+  "version": "1.1.0",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false,
+    "extendedAgentCard": false
+  },
+  "skills": [
+    {"id": "chat", "name": "AI 对话", "description": "通用 AI 对话助手"},
+    {"id": "web_search", "name": "网络搜索", "description": "互联网信息搜索与摘要"},
+    {"id": "coding", "name": "代码开发", "description": "代码编写、调试与优化"},
+    {"id": "analysis", "name": "分析报告", "description": "数据与文本深度分析"}
+  ],
+  "securitySchemes": {
+    "apiKey": {
+      "type": "apiKey",
+      "name": "apiKey",
+      "in": "header",
+      "description": "API Key 认证"
+    }
+  },
+  "security": ["apiKey"]
+}
+```
+
+### 客户端认证方式
+
+客户端必须在请求 Header 中提供 API Key：
+
+| Header | 示例 |
+|--------|------|
+| `Authorization: Bearer <key>` | `Authorization: Bearer sk-xxx` |
+| `x-api-key: <key>` | `x-api-key: sk-xxx` |
+
+服务端通过 Agent Card 的 `securitySchemes` 声明了解认证方式。
 
 ---
 
@@ -80,13 +160,14 @@ curl -X POST http://localhost:8644/send \
 | `A2A_PORT` | `8643` | 监听端口 |
 | `A2A_PEER_URL` | 空 | 对端地址（用于主动发送，不配则只收不发） |
 | `A2A_NAME` | `node-{port}` | 节点名称，响应中标识身份 |
-| `AI_PROVIDER_API_KEY` | 空 | AI API Key（处理收到的任务） |
 | `AI_PROVIDER_BASE_URL` | `https://api.minimaxi.com/anthropic` | AI API 地址 |
 | `A2A_MODEL` | `gpt-4o` | AI 模型 |
 | `A2A_MAX_TOKENS` | `1024` | 最大 token 数 |
 | `A2A_IDEMPOTENCY_DB` | `/tmp/a2a_idempotency_{port}.db` | 幂等数据库路径 |
 | `A2A_SESSION_DB` | `/tmp/a2a_sessions_{port}.db` | 会话数据库路径 |
 | `A2A_ENV_PATH` | `.env` | .env 文件路径（docker 挂载用） |
+
+**注意：v1.1.0 不再从环境变量读取 AI API Key**，改为由客户端在请求 Header 中提供。
 
 ---
 
@@ -148,10 +229,12 @@ curl -X POST http://localhost:8644/send \
 
 | Method | Path | 说明 |
 |--------|------|------|
-| POST | `/a2a` | 接收任务委托 |
+| GET | `/.well-known/agent-card.json` | **新增** Agent Card（v1.1.0） |
+| GET | `/a2a/.well-known/agent-card.json` | **新增** Agent Card 别名（v1.1.0） |
+| POST | `/a2a` | 接收任务委托（需认证） |
 | GET | `/a2a/{task_id}` | 查询任务状态 |
 | POST | `/send` | 主动向对端发送任务 |
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 健康检查（包含 agentCardUrl） |
 | GET | `/ready` | K8s 就绪探针 |
 | GET | `/live` | K8s 存活探针 |
 | GET | `/capabilities` | 支持的特性列表 |
@@ -175,6 +258,8 @@ services:
                A2A_PORT=8643
                A2A_PEER_URL=http://peer:8644
                A2A_NAME=my-agent
+               AI_PROVIDER_BASE_URL=https://api.minimaxi.com/anthropic
+               A2A_MODEL=gpt-4o
                python a2a.py"
 ```
 
@@ -196,6 +281,7 @@ services:
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| **v1.1.0** | 2026-05-26 | **Agent Card + 客户端认证**：新增 `/.well-known/agent-card.json` 和 `/a2a/.well-known/agent-card.json` 端点；API Key 从请求 Header 提取（Authorization: Bearer 或 x-api-key），不再从环境变量读取；/health 包含 agentCardUrl 字段；/capabilities 按官方规范格式 |
 | **v1.0.0** | 2026-05-26 | **一体化通用版本** — 一个 py 文件，`A2A_PORT`+`A2A_PEER_URL` 开箱即用，不分 client/server；/send 主动发送端点；K8s 探针 |
 | v0.2.2.1 | 2026-05-14 | httpx 全局连接池 + 差异化超时 + 错误分类重试 |
 | v0.2.1.0 | 2026-05-13 | 会话亲和（session_id 相同自动注入历史上下文） |

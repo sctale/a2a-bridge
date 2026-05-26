@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-A2A Bridge — 通用双向 Agent 通信节点 v1.0.0
+A2A Bridge — 通用双向 Agent 通信节点 v1.1.0
 
 设计原则：
 - 每个实例既是 Server（接收任务）也是 Client（发送任务）
 - 不分客户端/服务端，只有 port + peer 配置
-- 环境变量驱动，所有敏感配置通过 env 注入
+- 环境变量驱动，所有配置通过 env 注入
 
 启动：
     A2A_PORT=8643 A2A_PEER_URL=http://localhost:8644 python a2a.py
@@ -14,13 +14,15 @@ A2A Bridge — 通用双向 Agent 通信节点 v1.0.0
     A2A_PORT              监听端口（默认 8643）
     A2A_PEER_URL          对端地址，用于主动发任务（默认空，不主动发送）
     A2A_NAME              节点名称（默认 "node-{port}"）
-    AI_PROVIDER_API_KEY   本节点 AI API Key（用于处理收到的任务）
     AI_PROVIDER_BASE_URL  AI API 地址（默认 https://api.minimaxi.com/anthropic）
     A2A_MODEL             AI 模型（默认 gpt-4o）
     A2A_MAX_TOKENS        最大 token 数（默认 1024）
     A2A_IDEMPOTENCY_DB    幂等 DB 路径（默认 /tmp/a2a_idempotency_{port}.db）
     A2A_SESSION_DB        会话 DB 路径（默认 /tmp/a2a_sessions_{port}.db）
     A2A_ENV_PATH          .env 文件路径（用于 docker 挂载 .env）
+
+注意：v1.1.0 不再从环境变量读取 AI API Key，改为由客户端在请求 Header 中提供
+      （Authorization: Bearer <key> 或 x-api-key: <key>）
 """
 import asyncio
 import datetime as dt
@@ -34,11 +36,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
+from typing import Optional
 import uvicorn
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ─── 日志 ─────────────────────────────────────────────────────────────
 
@@ -238,15 +241,20 @@ _TASK_TIMEOUTS: Dict[str, float] = {
     "analysis": 120.0,
 }
 
-# ─── AI 调用 ──────────────────────────────────────────────────────────
+# ─── API Key 提取（从请求 Header）─────────────────────────────────────
 
-def _load_ai_key() -> str:
-    """从环境变量或 .env 文件加载 AI key"""
-    for key in ("AI_PROVIDER_API_KEY", "MINIMAX_CN_API_KEY"):
-        key_val = _load_env(key)
-        if key_val:
-            return key_val
+def _extract_api_key(request: Request) -> str:
+    """从请求 header 中提取 API Key（Authorization: Bearer 或 x-api-key）"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    api_key = request.headers.get("x-api-key", "")
+    if api_key:
+        return api_key
     return ""
+
+
+# ─── AI 调用 ──────────────────────────────────────────────────────────
 
 
 async def call_ai(
@@ -258,9 +266,9 @@ async def call_ai(
     base_url: str = "",
     model: str = "",
 ) -> str:
-    """异步 httpx 调用 AI，支持多来源 key 读取"""
+    """异步 httpx 调用 AI，api_key 必须由调用方从请求 header 提取后传入"""
     if not api_key:
-        api_key = _load_ai_key()
+        raise ValueError("API Key 未提供（客户端需在请求 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>）")
     if not base_url:
         base_url = AI_BASE_URL
     if not model:
@@ -363,13 +371,17 @@ def _resolve_task_type(payload: Dict, context: Dict) -> str:
 # ─── HTTP 端点 ────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    host = request.headers.get("host", f"localhost:{MY_PORT}")
+    agent_card_url = f"{scheme}://{host}/.well-known/agent-card.json"
     return {
         "status": "ok",
         "name": MY_NAME,
         "port": MY_PORT,
         "peer": MY_PEER_URL or None,
         "version": __version__,
+        "agentCardUrl": agent_card_url,
     }
 
 
@@ -387,6 +399,42 @@ async def live():
 async def capabilities():
     return {
         "version": __version__,
+        "name": MY_NAME,
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "extendedAgentCard": False,
+        },
+        "skills": [
+            {
+                "id": "chat",
+                "name": "AI 对话",
+                "description": "通用 AI 对话助手，回答简洁直接",
+            },
+            {
+                "id": "web_search",
+                "name": "网络搜索",
+                "description": "互联网信息搜索与摘要",
+            },
+            {
+                "id": "coding",
+                "name": "代码开发",
+                "description": "代码编写、调试与优化",
+            },
+            {
+                "id": "analysis",
+                "name": "分析报告",
+                "description": "数据与文本深度分析",
+            },
+        ],
+        "securitySchemes": {
+            "apiKey": {
+                "type": "apiKey",
+                "name": "apiKey",
+                "in": "header",
+                "description": "API Key 认证，客户端在请求 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>",
+            }
+        },
         "features": {
             "idempotency": True,
             "session_affinity": True,
@@ -395,6 +443,73 @@ async def capabilities():
             "version_negotiation": True,
         },
     }
+
+
+def _build_agent_card(request: Request) -> Dict:
+    """构建标准 Agent Card JSON"""
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    host = request.headers.get("host", f"localhost:{MY_PORT}")
+    base_url = f"{scheme}://{host}"
+    return {
+        "name": MY_NAME,
+        "description": f"A2A Bridge Agent — {MY_NAME}，支持 ping/chat/web_search/coding/analysis 任务类型",
+        "url": base_url,
+        "version": __version__,
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "extendedAgentCard": False,
+        },
+        "skills": [
+            {
+                "id": "chat",
+                "name": "AI 对话",
+                "description": "通用 AI 对话助手，回答简洁直接",
+            },
+            {
+                "id": "web_search",
+                "name": "网络搜索",
+                "description": "互联网信息搜索与摘要",
+            },
+            {
+                "id": "coding",
+                "name": "代码开发",
+                "description": "代码编写、调试与优化",
+            },
+            {
+                "id": "analysis",
+                "name": "分析报告",
+                "description": "数据与文本深度分析",
+            },
+        ],
+        "securitySchemes": {
+            "apiKey": {
+                "type": "apiKey",
+                "name": "apiKey",
+                "in": "header",
+                "description": "API Key 认证，客户端在请求 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>",
+            }
+        },
+        "security": ["apiKey"],
+    }
+
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card(request: Request):
+    """官方 A2A Protocol Agent Card 端点"""
+    return JSONResponse(
+        content=_build_agent_card(request),
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@app.get("/a2a/.well-known/agent-card.json")
+async def agent_card_alias(request: Request):
+    """A2A 官方路径别名（兼容官方客户端）"""
+    return JSONResponse(
+        content=_build_agent_card(request),
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.post("/a2a")
@@ -467,7 +582,17 @@ async def receive_task(request: Request):
             task_id=task_id, status="success", result=result, to_agent=from_agent,
         ))
 
-    # ── AI 调用 ──
+    # ── AI 调用（从请求 Header 提取 API Key）──
+    api_key = _extract_api_key(request)
+    if not api_key:
+        tasks[task_id]["status"] = "failed"
+        _idempotency.set(task_id, "failed", None)
+        return JSONResponse(status_code=401, content=make_response(
+            task_id=task_id, status="failed",
+            error={"code": 401, "message": "未提供 API Key（客户端需在 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>）"},
+            to_agent=from_agent,
+        ))
+
     system_prompt = f"你是 {MY_NAME}，一个 AI 助手。回答简洁直接，一针见血。"
     if context:
         system_prompt += f"\n\n附加上下文: {json.dumps(context, ensure_ascii=False)}"
@@ -476,6 +601,7 @@ async def receive_task(request: Request):
     try:
         response_text = await call_ai(
             system_prompt, instruction, session_id, task_type,
+            api_key=api_key,
         )
     except Exception as exc:
         logger.exception(f"[{MY_NAME}] AI 调用异常: {exc}")
