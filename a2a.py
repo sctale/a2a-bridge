@@ -668,6 +668,8 @@ async def send_task(request: Request):
     ))
 
 
+# ─── Lifespan + 启动 ────────────────────────────────────────────────
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(_cleanup_loop())
@@ -682,7 +684,6 @@ async def _cleanup_loop():
             logger.info(f"[{MY_NAME}] 会话清理完成")
         except Exception as exc:
             logger.warning(f"[{MY_NAME}] 会话清理异常: {exc}")
-
 
 # ─── 启动 ─────────────────────────────────────────────────────────────
 
