@@ -348,6 +348,19 @@ def _resolve_task_type(payload: Dict, context: Dict) -> str:
     return context.get("task_type") or payload.get("task_type", "chat")
 
 
+def _get_local_ip() -> str:
+    """获取本机局域网 IP（用于 reply_to 地址）"""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.168.20.252", 8644))  # 连接对端获取路由出口IP
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 # ─── HTTP 端点 ────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -570,6 +583,33 @@ async def _relay_result(body: Dict):
         logger.warning(f"[{MY_NAME}] task_result relay 失败: {exc}")
 
 
+@app.post("/report")
+async def receive_report(request: Request):
+    """接收对端的工作汇报，回写到原始任务的 idempotency 缓存"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    task_id = body.get("task_id") or str(uuid.uuid4())
+    from_agent = body.get("from", "unknown")
+    result = body.get("result")
+    status = body.get("status", "success")
+
+    logger.info(f"[{MY_NAME}] ← 汇报 from {from_agent}: task_id={task_id} status={status}")
+
+    # 回写结果到幂等缓存，唤醒等待中的同步调用
+    if result:
+        _idempotency.set(task_id, status, result)
+
+    # 返回确认
+    return JSONResponse(content=make_response(
+        task_id=task_id,
+        status="received",
+        to_agent=from_agent,
+    ))
+
+
 @app.get("/a2a/{task_id}")
 async def get_task(task_id: str):
     """查询任务状态（优先查 SQLite 持久化，备用内存）"""
@@ -628,6 +668,7 @@ async def send_task(request: Request):
             "instruction": instruction,
             "context": context,
             "session_id": session_id,
+            "reply_to": f"http://{_get_local_ip()}:{MY_PORT}",
         },
     }
 
@@ -638,34 +679,75 @@ async def send_task(request: Request):
             task_id=task_id, status=cached["status"], result=cached["result"],
         ))
 
+    # sync=true 时同步等待结果（默认行为，保留兼容）
+    # sync=false 时立即返回 queued（并发场景）
+    sync = body.get("sync", True)
     timeout = _TASK_TIMEOUTS.get(task_type, 120.0)
     client = get_httpx_client()
 
+    if sync:
+        # ── 同步模式：等待对端处理完返回结果 ─────────────────────────────
+        try:
+            resp = await client.post(
+                f"{MY_PEER_URL}/a2a",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except Exception as exc:
+            logger.exception(f"[{MY_NAME}] 任务 {task_id} 失败: {exc}")
+            return JSONResponse(status_code=500, content=make_response(
+                task_id=task_id, status="failed",
+                error={"code": 500, "message": str(exc)},
+            ))
+
+        if result.get("status") == "success":
+            _idempotency.set(task_id, "success", result.get("result"))
+
+        return JSONResponse(content=make_response(
+            task_id=task_id,
+            status=result.get("status", "success"),
+            result=result.get("result"),
+            to_agent=MY_NAME,
+        ))
+
+    # ── 并发模式：立即返回 queued，结果通过 /a2a/{task_id} 查询 ─────────
+    asyncio.create_task(_send_and_poll(task_id, MY_PEER_URL, payload))
+    return JSONResponse(content=make_response(
+        task_id=task_id, status="queued",
+        result={"output": f"任务已排队，等待处理中", "data": {"task_id": task_id}, "attachments": []},
+        to_agent=MY_NAME,
+    ))
+
+
+async def _send_and_poll(task_id: str, peer_url: str, payload: Dict):
+    """异步发任务到对端，轮询结果后更新幂等缓存"""
+    await asyncio.sleep(0.5)  # 给对端一点启动时间
+
+    cached = _idempotency.get(task_id)
+    if cached:
+        return
+
+    client = get_httpx_client()
     try:
         resp = await client.post(
-            f"{MY_PEER_URL}/a2a",
+            f"{peer_url}/a2a",
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=timeout,
+            timeout=_TASK_TIMEOUTS.get(payload.get("payload", {}).get("task_type", "chat"), 120.0),
         )
         resp.raise_for_status()
         result = resp.json()
+
+        if result.get("status") == "success":
+            _idempotency.set(task_id, "success", result.get("result"))
+
+        logger.info(f"[{MY_NAME}] 任务 {task_id} 已完成 status={result.get('status')}")
     except Exception as exc:
-        logger.exception(f"[{MY_NAME}] 主动发送失败: {exc}")
-        return JSONResponse(status_code=500, content=make_response(
-            task_id=task_id, status="failed",
-            error={"code": 500, "message": str(exc)},
-        ))
-
-    if result.get("status") == "success":
-        _idempotency.set(task_id, "success", result.get("result"))
-
-    return JSONResponse(content=make_response(
-        task_id=task_id,
-        status=result.get("status", "success"),
-        result=result.get("result"),
-        to_agent=MY_NAME,
-    ))
+        logger.exception(f"[{MY_NAME}] 任务 {task_id} 失败: {exc}")
+        _idempotency.set(task_id, "failed", {"output": f"任务执行失败: {exc}"})
 
 
 # ─── Lifespan + 启动 ────────────────────────────────────────────────
