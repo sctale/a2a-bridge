@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-A2A Bridge — 通用双向 Agent 通信节点 v1.1.0
+A2A Bridge — 通用双向 Agent 通信节点 v1.2.0
 
 设计原则：
 - 每个实例既是 Server（接收任务）也是 Client（发送任务）
 - 不分客户端/服务端，只有 port + peer 配置
 - 环境变量驱动，所有配置通过 env 注入
+- 无需 API Key，内网互通
 
 启动：
     A2A_PORT=8643 A2A_PEER_URL=http://localhost:8644 python a2a.py
@@ -13,16 +14,13 @@ A2A Bridge — 通用双向 Agent 通信节点 v1.1.0
 环境变量：
     A2A_PORT              监听端口（默认 8643）
     A2A_PEER_URL          对端地址，用于主动发任务（默认空，不主动发送）
-    A2A_NAME              节点名称（默认 "node-{port}"）
+    A2A_NAME              节点名称（默认 HOSTNAME 或 "node-{port}"）
     AI_PROVIDER_BASE_URL  AI API 地址（默认 https://api.minimaxi.com/anthropic）
     A2A_MODEL             AI 模型（默认 gpt-4o）
-    A2A_MAX_TOKENS        最大 token 数（默认 1024）
+    A2A_MAX_TOKENS        最大 token 数（默认 2048）
     A2A_IDEMPOTENCY_DB    幂等 DB 路径（默认 /tmp/a2a_idempotency_{port}.db）
     A2A_SESSION_DB        会话 DB 路径（默认 /tmp/a2a_sessions_{port}.db）
     A2A_ENV_PATH          .env 文件路径（用于 docker 挂载 .env）
-
-注意：v1.1.0 不再从环境变量读取 AI API Key，改为由客户端在请求 Header 中提供
-      （Authorization: Bearer <key> 或 x-api-key: <key>）
 """
 import asyncio
 import datetime as dt
@@ -36,12 +34,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from typing import Optional
 import uvicorn
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ─── 日志 ─────────────────────────────────────────────────────────────
 
@@ -80,13 +77,16 @@ MY_PEER_URL = os.environ.get("A2A_PEER_URL", "").rstrip("/")  # 空=仅接收，
 # AI 配置
 AI_BASE_URL = _load_env("AI_PROVIDER_BASE_URL") or "https://api.minimaxi.com/anthropic"
 AI_MODEL = os.environ.get("A2A_MODEL", "gpt-4o")
-AI_MAX_TOKENS = int(os.environ.get("A2A_MAX_TOKENS", "1024"))
+AI_API_KEY = _load_env("AI_PROVIDER_API_KEY")  # 从 .env 读取，不再从请求 header
+AI_MAX_TOKENS = int(os.environ.get("A2A_MAX_TOKENS", "2048"))
 
 # 数据库路径（每个端口独立 DB，重启不混淆）
 IDEMPOTENCY_DB = os.environ.get("A2A_IDEMPOTENCY_DB", f"/tmp/a2a_idempotency_{MY_PORT}.db")
 SESSION_DB = os.environ.get("A2A_SESSION_DB", f"/tmp/a2a_sessions_{MY_PORT}.db")
 
 logger.info(f"[{MY_NAME}] 启动 A2A Bridge，port={MY_PORT} peer={MY_PEER_URL or '(仅接收)'}")
+if not AI_API_KEY:
+    logger.warning(f"[{MY_NAME}] AI_PROVIDER_API_KEY 未配置，AI 调用可能失败")
 
 # ─── FastAPI App ──────────────────────────────────────────────────────
 
@@ -104,7 +104,7 @@ def get_httpx_client() -> httpx.AsyncClient:
     global _httpx_client
     if _httpx_client is None or _httpx_client.is_closed:
         _httpx_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
     return _httpx_client
@@ -241,19 +241,6 @@ _TASK_TIMEOUTS: Dict[str, float] = {
     "analysis": 120.0,
 }
 
-# ─── API Key 提取（从请求 Header）─────────────────────────────────────
-
-def _extract_api_key(request: Request) -> str:
-    """从请求 header 中提取 API Key（Authorization: Bearer 或 x-api-key）"""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    api_key = request.headers.get("x-api-key", "")
-    if api_key:
-        return api_key
-    return ""
-
-
 # ─── AI 调用 ──────────────────────────────────────────────────────────
 
 
@@ -262,22 +249,15 @@ async def call_ai(
     instruction: str,
     session_id: Optional[str] = None,
     task_type: str = "chat",
-    api_key: str = "",
-    base_url: str = "",
-    model: str = "",
 ) -> str:
-    """异步 httpx 调用 AI，api_key 必须由调用方从请求 header 提取后传入"""
-    if not api_key:
-        raise ValueError("API Key 未提供（客户端需在请求 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>）")
-    if not base_url:
-        base_url = AI_BASE_URL
-    if not model:
-        model = AI_MODEL
+    """异步 httpx 调用 AI，API Key 从环境变量读取"""
+    if not AI_API_KEY:
+        raise ValueError("AI_PROVIDER_API_KEY 未配置")
 
     timeout = _TASK_TIMEOUTS.get(task_type, 120.0)
     messages = _build_messages(instruction, session_id)
     payload = {
-        "model": model,
+        "model": AI_MODEL,
         "max_tokens": AI_MAX_TOKENS,
         "system": system_prompt,
         "messages": messages,
@@ -288,11 +268,11 @@ async def call_ai(
         try:
             client = get_httpx_client()
             resp = await client.post(
-                f"{base_url}/v1/messages",
+                f"{AI_BASE_URL}/v1/messages",
                 headers={
-                    "Authorization": f"Bearer {api_key}",
+                    "Authorization": f"Bearer {AI_API_KEY}",
                     "Content-Type": "application/json",
-                    "x-api-key": api_key,
+                    "x-api-key": AI_API_KEY,
                     "anthropic-version": "2023-06-01",
                 },
                 json=payload,
@@ -406,35 +386,11 @@ async def capabilities():
             "extendedAgentCard": False,
         },
         "skills": [
-            {
-                "id": "chat",
-                "name": "AI 对话",
-                "description": "通用 AI 对话助手，回答简洁直接",
-            },
-            {
-                "id": "web_search",
-                "name": "网络搜索",
-                "description": "互联网信息搜索与摘要",
-            },
-            {
-                "id": "coding",
-                "name": "代码开发",
-                "description": "代码编写、调试与优化",
-            },
-            {
-                "id": "analysis",
-                "name": "分析报告",
-                "description": "数据与文本深度分析",
-            },
+            {"id": "chat", "name": "AI 对话", "description": "通用 AI 对话助手，回答简洁直接"},
+            {"id": "web_search", "name": "网络搜索", "description": "互联网信息搜索与摘要"},
+            {"id": "coding", "name": "代码开发", "description": "代码编写、调试与优化"},
+            {"id": "analysis", "name": "分析报告", "description": "数据与文本深度分析"},
         ],
-        "securitySchemes": {
-            "apiKey": {
-                "type": "apiKey",
-                "name": "apiKey",
-                "in": "header",
-                "description": "API Key 认证，客户端在请求 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>",
-            }
-        },
         "features": {
             "idempotency": True,
             "session_affinity": True,
@@ -461,36 +417,11 @@ def _build_agent_card(request: Request) -> Dict:
             "extendedAgentCard": False,
         },
         "skills": [
-            {
-                "id": "chat",
-                "name": "AI 对话",
-                "description": "通用 AI 对话助手，回答简洁直接",
-            },
-            {
-                "id": "web_search",
-                "name": "网络搜索",
-                "description": "互联网信息搜索与摘要",
-            },
-            {
-                "id": "coding",
-                "name": "代码开发",
-                "description": "代码编写、调试与优化",
-            },
-            {
-                "id": "analysis",
-                "name": "分析报告",
-                "description": "数据与文本深度分析",
-            },
+            {"id": "chat", "name": "AI 对话", "description": "通用 AI 对话助手，回答简洁直接"},
+            {"id": "web_search", "name": "网络搜索", "description": "互联网信息搜索与摘要"},
+            {"id": "coding", "name": "代码开发", "description": "代码编写、调试与优化"},
+            {"id": "analysis", "name": "分析报告", "description": "数据与文本深度分析"},
         ],
-        "securitySchemes": {
-            "apiKey": {
-                "type": "apiKey",
-                "name": "apiKey",
-                "in": "header",
-                "description": "API Key 认证，客户端在请求 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>",
-            }
-        },
-        "security": ["apiKey"],
     }
 
 
@@ -530,6 +461,18 @@ async def receive_task(request: Request):
 
     logger.info(f"[{MY_NAME}] ← 任务 {task_id} from {from_agent} → {to_agent} ({msg_type})")
 
+    # ── task_result 中继：收到对端结果，转发给目标 ─────────────────────
+    if msg_type == "task_result":
+        # 有 to_agent 且不是自己，说明是relay，直接转发
+        if to_agent and to_agent not in (MY_NAME, "*", ""):
+            if MY_PEER_URL:
+                asyncio.create_task(_relay_result(body))
+            else:
+                logger.warning(f"[{MY_NAME}] task_result relay 需要 A2A_PEER_URL，当前未配置")
+        return JSONResponse(content=make_response(
+            task_id=task_id, status="received", to_agent=from_agent,
+        ))
+
     if msg_type != "task_delegate":
         return JSONResponse(status_code=400, content=make_response(
             task_id=task_id, status="failed",
@@ -547,7 +490,7 @@ async def receive_task(request: Request):
     instruction = payload.get("instruction", "")
     task_type = _resolve_task_type(payload, context)
 
-    if not instruction:
+    if not instruction and task_type != "ping":
         return JSONResponse(status_code=400, content=make_response(
             task_id=task_id, status="failed",
             error={"code": 400, "message": "payload.instruction 不能为空"},
@@ -582,18 +525,12 @@ async def receive_task(request: Request):
             task_id=task_id, status="success", result=result, to_agent=from_agent,
         ))
 
-    # ── AI 调用（从请求 Header 提取 API Key）──
-    api_key = _extract_api_key(request)
-    if not api_key:
-        tasks[task_id]["status"] = "failed"
-        _idempotency.set(task_id, "failed", None)
-        return JSONResponse(status_code=401, content=make_response(
-            task_id=task_id, status="failed",
-            error={"code": 401, "message": "未提供 API Key（客户端需在 Header 中提供 Authorization: Bearer <key> 或 x-api-key: <key>）"},
-            to_agent=from_agent,
-        ))
-
-    system_prompt = f"你是 {MY_NAME}，一个 AI 助手。回答简洁直接，一针见血。"
+    # ── AI 调用 ──
+    system_prompt = (
+        f"你是 {MY_NAME}，一个 AI 助手。回答简洁直接，一针见血。\n"
+        "遇到问题先想清楚再回答，不要瞎猜。\n"
+        "不知道就说不知道，不编数据。"
+    )
     if context:
         system_prompt += f"\n\n附加上下文: {json.dumps(context, ensure_ascii=False)}"
 
@@ -601,7 +538,6 @@ async def receive_task(request: Request):
     try:
         response_text = await call_ai(
             system_prompt, instruction, session_id, task_type,
-            api_key=api_key,
         )
     except Exception as exc:
         logger.exception(f"[{MY_NAME}] AI 调用异常: {exc}")
@@ -618,13 +554,27 @@ async def receive_task(request: Request):
     ))
 
 
+async def _relay_result(body: Dict):
+    """将 task_result 异步转发给对端"""
+    try:
+        client = get_httpx_client()
+        resp = await client.post(
+            f"{MY_PEER_URL}/a2a",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        logger.info(f"[{MY_NAME}] task_result relay 成功")
+    except Exception as exc:
+        logger.warning(f"[{MY_NAME}] task_result relay 失败: {exc}")
+
+
 @app.get("/a2a/{task_id}")
 async def get_task(task_id: str):
     """查询任务状态（优先查 SQLite 持久化，备用内存）"""
-    # 先查内存
     if task_id in tasks:
         return tasks[task_id]
-    # 再查 SQLite（重启后内存丢失，查持久化）
     cached = _idempotency.get(task_id)
     if cached:
         return {
@@ -658,7 +608,7 @@ async def send_task(request: Request):
     context = body.get("context", {})
     session_id = body.get("session_id")
 
-    if not instruction:
+    if not instruction and task_type != "ping":
         return JSONResponse(status_code=400, content=make_response(
             task_id=task_id, status="failed",
             error={"code": 400, "message": "instruction 不能为空"},
@@ -707,7 +657,6 @@ async def send_task(request: Request):
             error={"code": 500, "message": str(exc)},
         ))
 
-    # 正确读取对端响应的 status 字段（在对端 result 里）
     if result.get("status") == "success":
         _idempotency.set(task_id, "success", result.get("result"))
 
