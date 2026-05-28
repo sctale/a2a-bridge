@@ -1,5 +1,26 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
 *.db
-.env
 *.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# A2A runtime files (per-instance)
+a2a_idempotency_*.db
+a2a_sessions_*.db
