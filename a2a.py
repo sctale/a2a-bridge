@@ -38,7 +38,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 
-__version__ = "1.2.0"
+__version__ = "1.2.2"
 
 # ─── 日志 ─────────────────────────────────────────────────────────────
 
@@ -349,11 +349,15 @@ def _resolve_task_type(payload: Dict, context: Dict) -> str:
 
 
 def _get_local_ip() -> str:
-    """获取本机局域网 IP（用于 reply_to 地址）"""
+    """获取本机局域网 IP（用于 reply_to 地址）
+
+    注意：不要写死对端 IP。用任意可达地址（公网/内网都行，
+    UDP connect 不真发包，只为读取路由表确认出口 IP）。
+    """
     try:
         import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("192.168.20.252", 8644))  # 连接对端获取路由出口IP
+        s.connect(("8.8.8.8", 80))  # 任意可达地址，UDP 不真发包
         ip = s.getsockname()[0]
         s.close()
         return ip

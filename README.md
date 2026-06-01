@@ -49,6 +49,19 @@ AI_PROVIDER_API_KEY=$MINIMAX_CN_API_KEY \
 python a2a.py
 ```
 
+> **⚠️ venv 警告（2026-06-01）：** 仓库自带的 `.venv/` 是空壳（只有 `pyvenv.cfg` 没装包），`pip install -r requirements.txt` 装到它没用。如果你已经有装好 fastapi/uvicorn/httpx 的 Python 环境，直接用那个的 python：
+>
+> ```bash
+> # 例：Hermes 自带 venv
+> /opt/hermes/.venv/bin/python3 a2a.py
+> ```
+>
+> 如果没有现成环境，先建一个：
+>
+> ```bash
+> python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python a2a.py
+> ```
+
 ### 3. 启动节点 B（端口 8644）
 
 ```bash
