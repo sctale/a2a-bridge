@@ -629,6 +629,70 @@ async def get_task(task_id: str):
     raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
 
 
+@app.get("/tasks")
+async def list_tasks(
+    status: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """列出最近任务（从 SQLite 读，可按 status 过滤）
+
+    Args:
+        status: pending/completed/failed/None（None=全部）
+        limit: 返回条数上限（默认 20，最大 100）
+        offset: 跳过条数（分页用）
+
+    Returns:
+        {"total": int, "tasks": [...]}
+    """
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
+
+    with _idempotency._lock:
+        if status:
+            cur = _idempotency._db.execute(
+                "SELECT task_id, status, created_at, completed_at, result "
+                "FROM processed_tasks WHERE status = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
+            )
+        else:
+            cur = _idempotency._db.execute(
+                "SELECT task_id, status, created_at, completed_at, result "
+                "FROM processed_tasks "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        rows = cur.fetchall()
+        total = _idempotency._db.execute(
+            "SELECT COUNT(*) FROM processed_tasks"
+            + (" WHERE status = ?" if status else ""),
+            (status,) if status else (),
+        ).fetchone()[0]
+
+    items = []
+    for row in rows:
+        task_id, st, created_at, completed_at, result_json = row
+        result_preview = None
+        if result_json:
+            try:
+                r = json.loads(result_json)
+                # 只返回 output 字段的预览，data 全量太占带宽
+                if isinstance(r, dict):
+                    out = r.get("output", "")
+                    result_preview = out[:200] if out else None
+            except Exception:
+                result_preview = "(parse error)"
+        items.append({
+            "task_id": task_id,
+            "status": st,
+            "created_at": created_at,
+            "completed_at": completed_at,
+            "result_preview": result_preview,
+        })
+    return {"total": total, "limit": limit, "offset": offset, "tasks": items}
+
+
 @app.post("/send")
 async def send_task(request: Request):
     """主动向对端发送任务（需配置 A2A_PEER_URL）"""
@@ -683,9 +747,9 @@ async def send_task(request: Request):
             task_id=task_id, status=cached["status"], result=cached["result"],
         ))
 
-    # sync=true 时同步等待结果（默认行为，保留兼容）
-    # sync=false 时立即返回 queued（并发场景）
-    sync = body.get("sync", True)
+    # sync=false 时立即返回 queued（默认，caller 不被阻塞）
+    # sync=true 时同步等待结果（需要时显式指定）
+    sync = body.get("sync", False)
     timeout = _TASK_TIMEOUTS.get(task_type, 120.0)
     client = get_httpx_client()
 
