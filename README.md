@@ -1,6 +1,6 @@
-# A2A Bridge — 通用双向 Agent 通信框架 v1.2.2
+# A2A Bridge — 通用双向 Agent 通信框架 v1.2.3
 
-[![Version](https://img.shields.io/badge/version-v1.2.2-blue)](https://github.com/sctale/a2a-bridge/releases)
+[![Version](https://img.shields.io/badge/version-v1.2.3-blue)](https://github.com/sctale/a2a-bridge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9+-blue)](https://www.python.org/)
 
@@ -305,6 +305,7 @@ services:
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| **v1.2.3** | 2026-06-01 | 修 _get_local_ip 写死对端 IP bug；__version__ 字符串同步；README 加 venv 警告 |
 | **v1.2.2** | 2026-05-28 | sync 参数（同步/异步双模式）；reply_to 回调字段；/report 端点（接收对端汇报） |
 | **v1.2.1** | 2026-05-28 | 修复重复 app 实例导致所有路由 404 的 bug |
 | **v1.2.0** | 2026-05-28 | **移除请求 Header 认证**（改从 env 读取）；修复 ping/instruction 空值 bug；增加 task_result 中继；扩大超时至 2048 |
